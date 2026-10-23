@@ -7,6 +7,9 @@
 #include <set>
 #include <vector>
 
+#include "zeek/EventHandler.h"
+#include "zeek/EventRegistry.h"
+#include "zeek/Func.h"
 #include "zeek/ID.h"
 #include "zeek/IPAddr.h"
 #include "zeek/Reporter.h"
@@ -266,6 +269,201 @@ ValPtr decode_val(R& r, ProfileFuncs& pfs, bool& ok) {
     }
 }
 
+// Whether an instruction's auxiliary info is within the currently supported
+// serialization subset. Gates the AST-heavy members (handled in later roadmap
+// steps) and record/vector construction (whose runtime scratch, e.g. zvec, is
+// sized outside the serialized fields).
+bool aux_serializable(const ZInstAux* aux) {
+    if ( aux->lambda || aux->wi || aux->cat_args || aux->attrs || aux->field_inits || aux->call_expr )
+        return false;
+    if ( ! aux->map.empty() || ! aux->rhs_map.empty() || ! aux->lhs_map.empty() )
+        return false;
+    for ( int i = 0; i < aux->n; ++i )
+        if ( const auto& c = aux->elems[i].Constant() )
+            if ( ! supported_const(c) )
+                return false;
+    return true;
+}
+
+void encode_int_vec(W& w, const std::vector<int>& v) {
+    w.u32(static_cast<uint32_t>(v.size()));
+    for ( auto x : v )
+        w.i32(x);
+}
+
+void encode_aux(W& w, ProfileFuncs& pfs, const ZInstAux* aux) {
+    w.u32(static_cast<uint32_t>(aux->n));
+    w.u8(aux->elems_has_slots ? 1 : 0);
+
+    for ( int i = 0; i < aux->n; ++i ) {
+        const auto& e = aux->elems[i];
+        if ( const auto& c = e.Constant() ) {
+            w.u8(2); // constant
+            encode_val(w, pfs, c);
+        }
+        else if ( e.GetType() ) {
+            w.u8(1); // frame slot with type
+            w.i32(e.Slot());
+            w.u64(pfs.HashType(e.GetType()));
+        }
+        else {
+            w.u8(0); // plain integer
+            w.i32(e.IntVal());
+        }
+    }
+
+    encode_int_vec(w, aux->map);
+    encode_int_vec(w, aux->rhs_map);
+    encode_int_vec(w, aux->lhs_map);
+    encode_int_vec(w, aux->loop_vars);
+
+    w.u32(static_cast<uint32_t>(aux->types.size()));
+    for ( auto& t : aux->types )
+        w.u64(pfs.HashType(t));
+
+    w.u32(static_cast<uint32_t>(aux->is_managed.size()));
+    for ( bool b : aux->is_managed )
+        w.u8(b ? 1 : 0);
+
+    w.u64(pfs.HashType(aux->value_var_type));
+
+    w.u8(aux->is_BiF_call ? 1 : 0);
+    w.u8(aux->can_change_non_locals ? 1 : 0);
+
+    w.u32(static_cast<uint32_t>(aux->cft.size()));
+    for ( auto& [k, v] : aux->cft ) {
+        w.u8(static_cast<uint8_t>(k));
+        w.i32(v);
+    }
+
+    // By-name references, re-resolved against the running process at load.
+    if ( aux->id_val ) {
+        w.u8(1);
+        w.str(aux->id_val->Name());
+    }
+    else
+        w.u8(0);
+
+    if ( aux->func ) {
+        w.u8(1);
+        w.str(aux->func->GetName());
+    }
+    else
+        w.u8(0);
+
+    if ( aux->event_handler ) {
+        w.u8(1);
+        w.str(aux->event_handler->Name());
+    }
+    else
+        w.u8(0);
+
+    // The zvec runtime-scratch vector is pre-sized by the compiler (e.g. to a
+    // record's field count for record constructors) and indexed during Exec;
+    // its size is part of the body's state, so serialize it faithfully. Its
+    // contents are filled at run time and need not be stored.
+    w.u32(static_cast<uint32_t>(aux->zvec.size()));
+}
+
+ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
+    auto n = r.u32();
+    if ( ! r.Ok() ) {
+        ok = false;
+        return nullptr;
+    }
+
+    auto aux = new ZInstAux(static_cast<int>(n));
+    aux->elems_has_slots = r.u8() != 0;
+
+    for ( int i = 0; i < static_cast<int>(n) && r.Ok() && ok; ++i ) {
+        auto kind = r.u8();
+        if ( kind == 2 ) {
+            auto cv = decode_val(r, pfs, ok);
+            if ( ok && cv )
+                aux->Add(i, cv);
+        }
+        else if ( kind == 1 ) {
+            auto slot = r.i32();
+            auto t = resolve_type(pfs, r.u64());
+            if ( ! t )
+                ok = false;
+            else
+                aux->Add(i, slot, t);
+        }
+        else
+            aux->Add(i, r.i32());
+    }
+
+    auto read_int_vec = [&](std::vector<int>& v) {
+        auto cnt = r.u32();
+        for ( uint32_t j = 0; j < cnt && r.Ok(); ++j )
+            v.push_back(r.i32());
+    };
+    read_int_vec(aux->map);
+    read_int_vec(aux->rhs_map);
+    read_int_vec(aux->lhs_map);
+    read_int_vec(aux->loop_vars);
+
+    auto n_types = r.u32();
+    for ( uint32_t j = 0; j < n_types && r.Ok() && ok; ++j ) {
+        auto t = resolve_type(pfs, r.u64());
+        if ( ! t )
+            ok = false;
+        else
+            aux->types.push_back(t);
+    }
+
+    auto n_managed = r.u32();
+    for ( uint32_t j = 0; j < n_managed && r.Ok(); ++j )
+        aux->is_managed.push_back(r.u8() != 0);
+
+    if ( auto h = r.u64() )
+        aux->value_var_type = resolve_type(pfs, h);
+
+    aux->is_BiF_call = r.u8() != 0;
+    aux->can_change_non_locals = r.u8() != 0;
+
+    auto n_cft = r.u32();
+    for ( uint32_t j = 0; j < n_cft && r.Ok(); ++j ) {
+        auto k = static_cast<ControlFlowType>(r.u8());
+        aux->cft[k] = r.i32();
+    }
+
+    if ( r.u8() == 1 ) {
+        auto name = r.str();
+        auto id = lookup_ID(name.c_str(), GLOBAL_MODULE_NAME, false, false, false);
+        if ( ! id )
+            ok = false;
+        else
+            aux->id_val = id;
+    }
+    if ( r.u8() == 1 ) {
+        auto name = r.str();
+        auto f = id::find_func(name);
+        if ( ! f )
+            ok = false;
+        else
+            aux->func = f.get();
+    }
+    if ( r.u8() == 1 ) {
+        auto name = r.str();
+        auto eh = event_registry->Lookup(name);
+        if ( ! eh )
+            ok = false;
+        else
+            aux->event_handler = eh;
+    }
+
+    // Restore the compiler-set size of the zvec runtime-scratch vector.
+    aux->zvec.resize(r.u32());
+
+    if ( ! r.Ok() || ! ok ) {
+        delete aux;
+        return nullptr;
+    }
+    return aux;
+}
+
 } // namespace
 
 bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::string& out) {
@@ -275,8 +473,8 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
         return false;
 
     for ( unsigned i = 0; i < body.end_pc; ++i )
-        if ( body.insts[i].aux )
-            return false; // aux handling is a later roadmap step
+        if ( body.insts[i].aux && ! aux_serializable(body.insts[i].aux) )
+            return false;
 
     W w(out);
     w.str(body.func_name);
@@ -342,6 +540,13 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
         w.str(l && l->FileName() ? l->FileName() : "");
         w.i32(l ? l->FirstLine() : 0);
         w.i32(l ? l->LastLine() : 0);
+
+        if ( in.aux ) {
+            w.u8(1);
+            encode_aux(w, pfs, in.aux);
+        }
+        else
+            w.u8(0);
     }
 
     return true;
@@ -444,6 +649,9 @@ ZBodyPtr ZBodySerializer::Deserialize(const std::string& in, ProfileFuncs& pfs) 
         auto interned = filename_pool().insert(fname).first;
         zi.loc = std::make_shared<ZAMLocInfo>(func_name, std::make_shared<Location>(interned->c_str(), line_f, line_l),
                                               nullptr);
+
+        if ( r.u8() == 1 )
+            zi.aux = decode_aux(r, pfs, ok);
 
         insts[i] = zi; // slice-copy base ZInst (final form; branches already concrete)
     }
