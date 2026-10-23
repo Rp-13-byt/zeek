@@ -24,9 +24,13 @@
 
 #include <string>
 
+#include "zeek/IntrusivePtr.h"
 #include "zeek/script_opt/ProfileFunc.h"
 
 namespace zeek::detail {
+
+class ZBody;
+using ZBodyPtr = IntrusivePtr<ZBody>;
 
 // Bump whenever the on-disk format or any ZAM encoding detail changes, so old
 // cache files are rejected rather than misread.
@@ -65,5 +69,34 @@ private:
     std::string build_id;
     p_hash_type options_hash = 0;
 };
+
+// Serializes a compiled ZBody to a byte string and reconstructs it. Used both
+// by the on-disk cache and by the round-trip self-verification mode.
+class ZBodySerializer {
+public:
+    // Serialize 'body' into 'out'. Returns false (leaving 'out' unspecified) if
+    // the body uses a feature not yet supported by the serializer, in which
+    // case the caller must not cache it.
+    static bool Serialize(const ZBody& body, ProfileFuncs& pfs, std::string& out);
+
+    // Reconstruct a ZBody from bytes produced by Serialize(), using 'pfs' (over
+    // the same scripts) to resolve types by hash. Returns nullptr on any
+    // malformed input or unresolvable reference.
+    static ZBodyPtr Deserialize(const std::string& in, ProfileFuncs& pfs);
+};
+
+// Round-trip self-verification (env-gated by ZEEK_ZAM_CACHE_VERIFY): if 'orig'
+// is serializable, serialize then immediately deserialize it and return the
+// reconstructed body (which the caller installs in place of the original), so
+// the existing btest baselines validate serialization faithfulness. Returns
+// nullptr if the body is not serializable or the round trip fails, in which
+// case the caller keeps the freshly compiled body.
+extern bool zam_cache_verify_active();
+extern ZBodyPtr zam_cache_roundtrip(const ZBody* orig, ProfileFuncs& pfs);
+
+// Reports round-trip verification coverage (how many bodies were serialized vs
+// gated) to stderr. Called at the end of analyze_scripts(). No-op unless
+// verification is active.
+extern void zam_cache_verify_report();
 
 } // namespace zeek::detail

@@ -514,6 +514,14 @@ static void optimize_func(ScriptFuncPtr f, std::shared_ptr<ProfileFunc> pf, cons
         if ( zam_cacheability_active() && new_body && new_body->Tag() == STMT_ZAM )
             static_cast<ZBody*>(new_body.get())->AssessCacheability(zam_cacheability_stats());
 
+        // Round-trip self-verification: if the compiled body serializes, swap
+        // in the reconstructed copy so existing btest baselines validate the
+        // serializer. Non-serializable bodies keep their freshly compiled form.
+        if ( zam_cache_verify_active() && new_body && new_body->Tag() == STMT_ZAM ) {
+            if ( auto rt = zam_cache_roundtrip(static_cast<ZBody*>(new_body.get()), *pfs) )
+                new_body = rt;
+        }
+
         if ( analysis_options.dump_final_ZAM )
             ZAM.Dump();
 
@@ -942,6 +950,7 @@ void analyze_scripts(bool no_unused_warnings) {
 
     zam_timing_report();
     zam_cacheability_report();
+    zam_cache_verify_report();
 
     if ( reporter->Errors() > 0 )
         reporter->FatalError("Optimized script execution aborted due to errors");

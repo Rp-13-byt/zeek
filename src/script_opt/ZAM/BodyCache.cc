@@ -3,11 +3,22 @@
 #include "zeek/script_opt/ZAM/BodyCache.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <set>
-#include <unordered_set>
 #include <vector>
 
+#include "zeek/ID.h"
+#include "zeek/IPAddr.h"
+#include "zeek/Reporter.h"
+#include "zeek/Scope.h"
+#include "zeek/Val.h"
+#include "zeek/module_util.h"
 #include "zeek/script_opt/ScriptOpt.h"
+#include "zeek/script_opt/ZAM/Profile.h"
+#include "zeek/script_opt/ZAM/Support.h"
+#include "zeek/script_opt/ZAM/ZBody.h"
+#include "zeek/script_opt/ZAM/ZInst.h"
+#include "zeek/script_opt/ZAM/ZInstAux.h"
 
 namespace zeek {
 extern const char* zeek_version();
@@ -83,6 +94,423 @@ void ZAMBodyCache::ComputeOptionsHash() {
     add_bool(o.no_ZAM_control_flow_opt);
 
     options_hash = h;
+}
+
+// ---- ZBody serialization ------------------------------------------------
+//
+// This is an incremental implementation. It serializes bodies whose
+// instruction stream and body-level structure fall within the currently
+// supported subset; Serialize() returns false for anything else so the caller
+// falls back to normal compilation (the cache never produces a wrong body).
+// Coverage grows per the roadmap in ZAM-CACHING-FINDINGS.md.
+
+namespace {
+
+// Owns interned filenames so Location's const char* stays valid for the life
+// of the process (Locations don't copy their filename).
+std::set<std::string>& filename_pool() {
+    static std::set<std::string> pool;
+    return pool;
+}
+
+// Little binary writer appending to a std::string.
+class W {
+public:
+    explicit W(std::string& b) : buf(b) {}
+    void u8(uint8_t v) { buf.append(1, static_cast<char>(v)); }
+    void u32(uint32_t v) { buf.append(reinterpret_cast<const char*>(&v), sizeof v); }
+    void i32(int32_t v) { buf.append(reinterpret_cast<const char*>(&v), sizeof v); }
+    void u64(uint64_t v) { buf.append(reinterpret_cast<const char*>(&v), sizeof v); }
+    void i64(int64_t v) { buf.append(reinterpret_cast<const char*>(&v), sizeof v); }
+    void dbl(double v) { buf.append(reinterpret_cast<const char*>(&v), sizeof v); }
+    void str(std::string_view s) {
+        u32(static_cast<uint32_t>(s.size()));
+        buf.append(s.data(), s.size());
+    }
+
+private:
+    std::string& buf;
+};
+
+// Little binary reader with bounds checking; any underrun sets ok=false and all
+// subsequent reads return zero/empty so callers can check ok once at the end.
+class R {
+public:
+    R(const char* p, size_t n) : cur(p), end(p + n) {}
+    bool Ok() const { return ok; }
+    bool AtEnd() const { return cur == end; }
+
+    uint8_t u8() { return read<uint8_t>(); }
+    uint32_t u32() { return read<uint32_t>(); }
+    int32_t i32() { return read<int32_t>(); }
+    uint64_t u64() { return read<uint64_t>(); }
+    int64_t i64() { return read<int64_t>(); }
+    double dbl() { return read<double>(); }
+    std::string str() {
+        auto n = u32();
+        if ( ! ok || static_cast<size_t>(end - cur) < n ) {
+            ok = false;
+            return {};
+        }
+        std::string s(cur, n);
+        cur += n;
+        return s;
+    }
+
+private:
+    template<typename T>
+    T read() {
+        T v{};
+        if ( static_cast<size_t>(end - cur) < sizeof(T) ) {
+            ok = false;
+            return v;
+        }
+        std::memcpy(&v, cur, sizeof(T));
+        cur += sizeof(T);
+        return v;
+    }
+
+    const char* cur;
+    const char* end;
+    bool ok = true;
+};
+
+// Atomic Val tags we can serialize. Anything else makes a body non-cacheable.
+bool supported_const(const ValPtr& v) {
+    switch ( v->GetType()->Tag() ) {
+        case TYPE_BOOL:
+        case TYPE_INT:
+        case TYPE_COUNT:
+        case TYPE_DOUBLE:
+        case TYPE_TIME:
+        case TYPE_INTERVAL:
+        case TYPE_STRING:
+        case TYPE_ADDR:
+        case TYPE_SUBNET:
+        case TYPE_PORT:
+        case TYPE_ENUM: return true;
+        default: return false;
+    }
+}
+
+void encode_val(W& w, ProfileFuncs& pfs, const ValPtr& v) {
+    auto t = v->GetType();
+    w.u64(pfs.HashType(t));
+    w.u32(static_cast<uint32_t>(t->Tag()));
+
+    switch ( t->Tag() ) {
+        case TYPE_BOOL:
+        case TYPE_INT: w.i64(v->AsInt()); break;
+        case TYPE_COUNT: w.u64(v->AsCount()); break;
+        case TYPE_DOUBLE: w.dbl(v->AsDouble()); break;
+        case TYPE_TIME: w.dbl(v->AsTime()); break;
+        case TYPE_INTERVAL: w.dbl(v->AsInterval()); break;
+        case TYPE_STRING: {
+            auto s = v->AsString();
+            w.str(std::string_view(reinterpret_cast<const char*>(s->Bytes()), s->Len()));
+        } break;
+        case TYPE_ADDR: w.str(v->AsAddr().AsString()); break;
+        case TYPE_SUBNET: w.str(v->AsSubNet().AsString()); break;
+        case TYPE_PORT: {
+            auto pv = v->AsPortVal();
+            w.u32(pv->Port());
+            w.u32(static_cast<uint32_t>(pv->PortType()));
+        } break;
+        case TYPE_ENUM: w.i64(v->AsEnum()); break;
+        default: break; // gated out by supported_const()
+    }
+}
+
+// Resolve a type hash to a live TypePtr in this process. 0 -> null.
+TypePtr resolve_type(ProfileFuncs& pfs, p_hash_type h) {
+    if ( h == 0 )
+        return nullptr;
+    auto rep = pfs.TypeForHash(h);
+    if ( ! rep )
+        return nullptr;
+    return {NewRef{}, const_cast<Type*>(rep)};
+}
+
+ValPtr decode_val(R& r, ProfileFuncs& pfs, bool& ok) {
+    auto hash = r.u64();
+    auto tag = static_cast<TypeTag>(r.u32());
+    auto type = resolve_type(pfs, hash);
+    if ( ! r.Ok() || ! type ) {
+        ok = false;
+        return nullptr;
+    }
+
+    switch ( tag ) {
+        case TYPE_BOOL: return val_mgr->Bool(r.i64() != 0);
+        case TYPE_INT: return val_mgr->Int(r.i64());
+        case TYPE_COUNT: return val_mgr->Count(r.u64());
+        case TYPE_DOUBLE: return make_intrusive<DoubleVal>(r.dbl());
+        case TYPE_TIME: return make_intrusive<TimeVal>(r.dbl());
+        case TYPE_INTERVAL: return make_intrusive<IntervalVal>(r.dbl());
+        case TYPE_STRING: return make_intrusive<StringVal>(r.str());
+        case TYPE_ADDR: return make_intrusive<AddrVal>(r.str());
+        case TYPE_SUBNET: {
+            auto s = r.str();
+            return make_intrusive<SubNetVal>(s.c_str());
+        }
+        case TYPE_PORT: {
+            auto num = r.u32();
+            auto proto = static_cast<TransportProto>(r.u32());
+            return val_mgr->Port(num, proto);
+        }
+        case TYPE_ENUM: {
+            auto i = r.i64();
+            return type->AsEnumType()->GetEnumVal(i);
+        }
+        default: ok = false; return nullptr;
+    }
+}
+
+} // namespace
+
+bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::string& out) {
+    // Capability gate: refuse bodies with structure we don't yet serialize.
+    if ( ! body.int_cases.empty() || ! body.uint_cases.empty() || ! body.double_cases.empty() ||
+         ! body.str_cases.empty() || ! body.table_iters.empty() || body.num_step_iters != 0 )
+        return false;
+
+    for ( unsigned i = 0; i < body.end_pc; ++i )
+        if ( body.insts[i].aux )
+            return false; // aux handling is a later roadmap step
+
+    W w(out);
+    w.str(body.func_name);
+    w.i32(body.frame_size);
+    w.u8(body.fixed_frame ? 1 : 0); // non-recursive -> pre-allocated fixed frame
+
+    w.u32(static_cast<uint32_t>(body.managed_slots.size()));
+    for ( auto s : body.managed_slots )
+        w.i32(s);
+
+    w.u32(static_cast<uint32_t>(body.frame_denizens.size()));
+    for ( auto& fd : body.frame_denizens ) {
+        w.u32(static_cast<uint32_t>(fd.names.size()));
+        for ( auto n : fd.names )
+            w.str(n);
+        w.u32(static_cast<uint32_t>(fd.id_start.size()));
+        for ( auto s : fd.id_start )
+            w.u64(s);
+        w.i32(fd.scope_end);
+        w.u8(fd.is_managed ? 1 : 0);
+    }
+
+    w.u32(static_cast<uint32_t>(body.modules.size()));
+    for ( auto& m : body.modules )
+        w.str(m);
+
+    // Globals: serialized by name, re-resolved against global scope at load.
+    w.u32(static_cast<uint32_t>(body.globals.size()));
+    for ( auto& g : body.globals ) {
+        w.str(g.id->Name());
+        w.i32(g.slot);
+    }
+
+    w.u32(body.end_pc);
+    for ( unsigned i = 0; i < body.end_pc; ++i ) {
+        auto& in = body.insts[i];
+
+        auto cv = in.ConstVal();
+        if ( cv && ! supported_const(cv) )
+            return false;
+
+        w.u32(static_cast<uint32_t>(in.op));
+        w.u32(static_cast<uint32_t>(in.op_type));
+        w.i32(in.v1);
+        w.i32(in.v2);
+        w.i32(in.v3);
+        w.i32(in.v4);
+        w.u64(pfs.HashType(in.GetType()));
+        w.u64(pfs.HashType(in.GetType2()));
+
+        // is_managed: 0 = unset, 1 = false, 2 = true.
+        w.u8(! in.is_managed ? 0 : (*in.is_managed ? 2 : 1));
+
+        if ( cv ) {
+            w.u8(1);
+            encode_val(w, pfs, cv);
+        }
+        else
+            w.u8(0);
+
+        // Location (flattened: no inlining parent chain yet).
+        auto l = in.loc ? in.loc->Loc() : nullptr;
+        w.str(l && l->FileName() ? l->FileName() : "");
+        w.i32(l ? l->FirstLine() : 0);
+        w.i32(l ? l->LastLine() : 0);
+    }
+
+    return true;
+}
+
+ZBodyPtr ZBodySerializer::Deserialize(const std::string& in, ProfileFuncs& pfs) {
+    R r(in.data(), in.size());
+
+    auto func_name = r.str();
+    // ZBody's deserialization constructor is private; ZBodySerializer is a
+    // friend, so construct directly and adopt the reference.
+    ZBodyPtr zb{AdoptRef{}, new ZBody(func_name)};
+
+    zb->frame_size = r.i32();
+    bool non_recursive = r.u8() != 0;
+
+    auto n_managed = r.u32();
+    for ( uint32_t i = 0; i < n_managed && r.Ok(); ++i )
+        zb->managed_slots.push_back(r.i32());
+
+    auto n_fd = r.u32();
+    for ( uint32_t i = 0; i < n_fd && r.Ok(); ++i ) {
+        FrameSharingInfo fd;
+        auto n_names = r.u32();
+        for ( uint32_t j = 0; j < n_names && r.Ok(); ++j ) {
+            auto interned = filename_pool().insert(r.str()).first;
+            fd.names.push_back(interned->c_str());
+        }
+        auto n_starts = r.u32();
+        for ( uint32_t j = 0; j < n_starts && r.Ok(); ++j )
+            fd.id_start.push_back(r.u64());
+        fd.scope_end = r.i32();
+        fd.is_managed = r.u8() != 0;
+        zb->frame_denizens.push_back(std::move(fd));
+    }
+
+    auto n_mod = r.u32();
+    for ( uint32_t i = 0; i < n_mod && r.Ok(); ++i )
+        zb->modules.insert(r.str());
+
+    auto n_glob = r.u32();
+    for ( uint32_t i = 0; i < n_glob && r.Ok(); ++i ) {
+        auto name = r.str();
+        auto slot = r.i32();
+        if ( ! r.Ok() )
+            break;
+        auto id = lookup_ID(name.c_str(), GLOBAL_MODULE_NAME, false, false, false);
+        if ( ! id )
+            return nullptr; // global no longer present -> safe miss
+        zb->globals.push_back(GlobalInfo{id, slot});
+    }
+
+    auto end_pc = r.u32();
+    if ( ! r.Ok() )
+        return nullptr;
+
+    // A placeholder current-location satisfies the ZInst constructor's
+    // assertion while we build instructions; each gets its real loc below.
+    // The Location must carry a non-null filename: ZAMLocInfo's constructor
+    // feeds it to func_name_at_loc(), which strlen()s it.
+    auto empty_fn = filename_pool().insert("").first->c_str();
+    auto prev_curr_loc = ZAM::curr_loc;
+    ZAM::curr_loc = std::make_shared<ZAMLocInfo>(func_name, std::make_shared<Location>(empty_fn, 0, 0), nullptr);
+
+    auto insts = new ZInst[end_pc];
+    bool ok = true;
+
+    for ( uint32_t i = 0; i < end_pc && r.Ok() && ok; ++i ) {
+        auto op = static_cast<ZOp>(r.u32());
+        auto op_type = static_cast<ZAMOpType>(r.u32());
+
+        ZInstI zi(op, op_type);
+        zi.v1 = r.i32();
+        zi.v2 = r.i32();
+        zi.v3 = r.i32();
+        zi.v4 = r.i32();
+
+        auto t = resolve_type(pfs, r.u64());
+        auto t2 = resolve_type(pfs, r.u64());
+        if ( t )
+            zi.SetType(t);
+        if ( t2 )
+            zi.SetType2(t2);
+
+        auto managed_flag = r.u8();
+        if ( managed_flag == 1 )
+            zi.is_managed = false;
+        else if ( managed_flag == 2 )
+            zi.is_managed = true;
+
+        if ( r.u8() == 1 ) {
+            auto cv = decode_val(r, pfs, ok);
+            if ( ok && cv )
+                zi.c = ZVal(cv, cv->GetType());
+        }
+
+        auto fname = r.str();
+        auto line_f = r.i32();
+        auto line_l = r.i32();
+        auto interned = filename_pool().insert(fname).first;
+        zi.loc = std::make_shared<ZAMLocInfo>(func_name, std::make_shared<Location>(interned->c_str(), line_f, line_l),
+                                              nullptr);
+
+        insts[i] = zi; // slice-copy base ZInst (final form; branches already concrete)
+    }
+
+    ZAM::curr_loc = prev_curr_loc;
+
+    if ( ! r.Ok() || ! ok ) {
+        delete[] insts;
+        return nullptr;
+    }
+
+    // Several ZBody members have no in-class default initializer and are
+    // normally set by the ZAMCompiler-driven constructor. The capability gate
+    // guarantees these are empty/zero for serialized bodies, but they must be
+    // set explicitly here since ZInst::Exec() reads them (e.g. num_step_iters
+    // sizes a stack vector).
+    zb->num_step_iters = 0;
+    zb->num_globals = static_cast<int>(zb->globals.size());
+
+    zb->insts = insts;
+    zb->end_pc = end_pc;
+    zb->inst_cnt = new uint64_t[end_pc];
+    for ( uint32_t i = 0; i < end_pc; ++i )
+        zb->inst_cnt[i] = 0;
+    zb->default_prof_vec = zb->BuildProfVec();
+    zb->curr_prof_vec = zb->default_prof_vec.get();
+
+    if ( non_recursive ) {
+        zb->fixed_frame = new ZVal[zb->frame_size];
+        for ( auto ms : zb->managed_slots )
+            zb->fixed_frame[ms].ClearManagedVal();
+    }
+
+    return zb;
+}
+
+bool zam_cache_verify_active() {
+    static const bool active = getenv("ZEEK_ZAM_CACHE_VERIFY") != nullptr;
+    return active;
+}
+
+static uint64_t rt_ok = 0;    // bodies serialized + reconstructed
+static uint64_t rt_gated = 0; // bodies the gate declined
+
+ZBodyPtr zam_cache_roundtrip(const ZBody* orig, ProfileFuncs& pfs) {
+    std::string buf;
+    if ( ! ZBodySerializer::Serialize(*orig, pfs, buf) ) {
+        ++rt_gated;
+        return nullptr;
+    }
+    auto zb = ZBodySerializer::Deserialize(buf, pfs);
+    if ( zb )
+        ++rt_ok;
+    else
+        ++rt_gated;
+    return zb;
+}
+
+void zam_cache_verify_report() {
+    // Only emit when explicitly debugging: verify mode runs during the btest
+    // suite, and many tests diff stderr, so it must stay silent by default.
+    if ( ! zam_cache_verify_active() || ! getenv("ZEEK_ZAM_CACHE_DEBUG") )
+        return;
+    auto total = rt_ok + rt_gated;
+    fprintf(stderr, "# ZAM cache round-trip verify: %llu/%llu bodies serialized (%.1f%%), %llu gated\n",
+            (unsigned long long)rt_ok, (unsigned long long)total,
+            total ? 100.0 * static_cast<double>(rt_ok) / total : 0.0, (unsigned long long)rt_gated);
 }
 
 } // namespace zeek::detail
