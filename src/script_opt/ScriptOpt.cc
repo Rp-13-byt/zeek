@@ -21,6 +21,7 @@
 #include "zeek/script_opt/Reduce.h"
 #include "zeek/script_opt/UsageAnalyzer.h"
 #include "zeek/script_opt/UseDefs.h"
+#include "zeek/script_opt/ZAM/BodyCache.h"
 #include "zeek/script_opt/ZAM/Compile.h"
 #include "zeek/script_opt/ZAM/Profile.h"
 
@@ -172,6 +173,26 @@ void zam_cacheability_report() {
 }
 
 // -------------------------------------------------------------------------
+
+// Diagnostic (env-gated by ZEEK_ZAM_CACHE_KEYS): prints each analyzed
+// function's effective cache key, sorted by name, so stability can be checked
+// across runs and across the addition of test-specific scripts. The key logic
+// itself lives in ZAMBodyCache::EffectiveKey.
+static void zam_cache_keys_report(const std::vector<FuncInfo>& funcs, const ProfileFuncs& pfs) {
+    if ( ! getenv("ZEEK_ZAM_CACHE_KEYS") )
+        return;
+
+    std::map<std::string, p_hash_type> keyed;
+    for ( auto& f : funcs ) {
+        if ( f.ShouldSkip() || ! f.Profile() )
+            continue;
+        keyed[f.Func()->GetName()] = ZAMBodyCache::EffectiveKey(f.Profile(), pfs);
+    }
+
+    fprintf(stderr, "# ZAM cache keys (ZEEK_ZAM_CACHE_KEYS): effective-key function\n");
+    for ( auto& [name, key] : keyed )
+        fprintf(stderr, "ZAM-cache-key %016llx %s\n", (unsigned long long)key, name.c_str());
+}
 
 // Tracks all of the loaded functions (including event handlers and hooks).
 static std::vector<FuncInfo> funcs;
@@ -914,6 +935,8 @@ void analyze_scripts(bool no_unused_warnings) {
         ZAMPhaseTimer t("profile");
         pfs = std::make_shared<ProfileFuncs>(funcs, nullptr, true);
     }
+
+    zam_cache_keys_report(funcs, *pfs);
 
     analyze_scripts_for_ZAM(pfs);
 
