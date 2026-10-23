@@ -10,6 +10,8 @@
 
 namespace zeek::detail {
 
+struct ZAMCacheabilityStats;
+
 // Static information about globals used in a function.
 class GlobalInfo {
 public:
@@ -55,6 +57,11 @@ public:
     // void SaveTo(FILE* f, int interp_frame_size) const;
 
     void Dump() const;
+
+    // Diagnostic: assess whether this body's instruction stream could be
+    // serialized to a cross-run cache, accumulating into 'stats'. See
+    // ZAMCacheabilityStats in ScriptOpt.h. Does not modify the body.
+    void AssessCacheability(ZAMCacheabilityStats& stats) const;
 
     // Specify whether to measure CPU & memory for calls to the given body.
     void SetProfilingCalls(bool active) {

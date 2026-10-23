@@ -2,6 +2,7 @@
 
 #include "zeek/script_opt/ScriptOpt.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -90,6 +91,84 @@ ZAMPhaseTimer::ZAMPhaseTimer(const char* phase) : phase(phase) {
 ZAMPhaseTimer::~ZAMPhaseTimer() {
     if ( active )
         zam_timing_add(phase, zam_now_secs() - start);
+}
+
+// -------------------------------------------------------------------------
+
+// ---- Cacheability analysis (see ScriptOpt.h) ----------------------------
+
+namespace {
+ZAMCacheabilityStats zam_cache_stats;
+} // namespace
+
+bool zam_cacheability_active() {
+    static const bool active = getenv("ZEEK_ZAM_CACHEABILITY") != nullptr;
+    return active;
+}
+
+ZAMCacheabilityStats& zam_cacheability_stats() { return zam_cache_stats; }
+
+bool zam_cacheability_assumed(const std::string& reason) {
+    // Parse ZEEK_ZAM_CACHE_ASSUME once into exact labels and category prefixes.
+    static const std::vector<std::string> assumed = [] {
+        std::vector<std::string> v;
+        const char* e = getenv("ZEEK_ZAM_CACHE_ASSUME");
+        if ( ! e )
+            return v;
+        std::string s = e;
+        size_t pos = 0;
+        while ( pos < s.size() ) {
+            auto comma = s.find(',', pos);
+            auto tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if ( ! tok.empty() )
+                v.push_back(tok);
+            if ( comma == std::string::npos )
+                break;
+            pos = comma + 1;
+        }
+        return v;
+    }();
+
+    for ( auto& a : assumed ) {
+        if ( a == reason )
+            return true;
+        // A token ending in ':' is a category prefix (e.g. "type:").
+        if ( ! a.empty() && a.back() == ':' && reason.starts_with(a) )
+            return true;
+    }
+    return false;
+}
+
+void zam_cacheability_report() {
+    if ( ! zam_cacheability_active() )
+        return;
+
+    auto& s = zam_cache_stats;
+    auto pct = [](uint64_t num, uint64_t den) { return den > 0 ? 100.0 * static_cast<double>(num) / den : 0.0; };
+
+    fprintf(stderr, "# ZAM cacheability (ZEEK_ZAM_CACHEABILITY): instruction-stream only;\n");
+    fprintf(stderr, "#   body-level case-maps/globals/frame layout not assessed.\n");
+    fprintf(stderr, "ZAM-cache bodies %llu cacheable %llu (%.1f%%)\n", (unsigned long long)s.bodies,
+            (unsigned long long)s.cacheable_bodies, pct(s.cacheable_bodies, s.bodies));
+    fprintf(stderr, "ZAM-cache insts %llu clean %llu (%.1f%%)\n", (unsigned long long)s.insts,
+            (unsigned long long)s.clean_insts, pct(s.clean_insts, s.insts));
+
+    // Sort blockers by number of bodies they block, descending.
+    std::vector<std::pair<std::string, uint64_t>> by_bodies(s.blocking_bodies.begin(), s.blocking_bodies.end());
+    std::ranges::sort(by_bodies, [](const auto& a, const auto& b) {
+        if ( a.second != b.second )
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+
+    fprintf(stderr, "# blocker: bodies-blocked (pct of bodies) / instruction-occurrences\n");
+    for ( auto& [reason, bodies] : by_bodies ) {
+        auto occ = s.blockers.contains(reason) ? s.blockers[reason] : 0;
+        fprintf(stderr, "ZAM-cache-blocker %-22s %8llu (%5.1f%%) %10llu\n", reason.c_str(), (unsigned long long)bodies,
+                pct(bodies, s.bodies), (unsigned long long)occ);
+    }
+
+    zam_cache_stats = ZAMCacheabilityStats{};
 }
 
 // -------------------------------------------------------------------------
@@ -410,6 +489,9 @@ static void optimize_func(ScriptFuncPtr f, std::shared_ptr<ProfileFunc> pf, cons
 
         if ( reporter->Errors() > 0 )
             return;
+
+        if ( zam_cacheability_active() && new_body && new_body->Tag() == STMT_ZAM )
+            static_cast<ZBody*>(new_body.get())->AssessCacheability(zam_cacheability_stats());
 
         if ( analysis_options.dump_final_ZAM )
             ZAM.Dump();
@@ -836,6 +918,7 @@ void analyze_scripts(bool no_unused_warnings) {
     analyze_scripts_for_ZAM(pfs);
 
     zam_timing_report();
+    zam_cacheability_report();
 
     if ( reporter->Errors() > 0 )
         reporter->FatalError("Optimized script execution aborted due to errors");

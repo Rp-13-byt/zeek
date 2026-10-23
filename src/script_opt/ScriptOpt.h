@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <regex>
 #include <string>
 #include <unordered_set>
@@ -327,6 +329,40 @@ extern void zam_timing_add(const char* phase, double seconds);
 
 // Write the accumulated per-phase timing summary to stderr and reset it.
 extern void zam_timing_report();
+
+// ---- Cacheability analysis (env-gated by ZEEK_ZAM_CACHEABILITY) ---------
+//
+// A diagnostic pass that estimates what fraction of compiled ZAM bodies could
+// be serialized to a cross-run cache under a candidate serializer, and builds a
+// histogram of exactly which instruction-stream features block the rest. Its
+// purpose is to size the full-serializer effort before committing to it; it
+// does not itself serialize anything. The claim it makes is deliberately scoped
+// to the instruction stream (ops, operands, per-instruction types, constants,
+// and ZInstAux contents); body-level structures such as switch case-maps,
+// globals, and frame layouts are not assessed here (noted in the report).
+struct ZAMCacheabilityStats {
+    uint64_t bodies = 0;           // compiled bodies seen
+    uint64_t cacheable_bodies = 0; // bodies whose every instruction is serializable
+    uint64_t insts = 0;            // instructions seen
+    uint64_t clean_insts = 0;      // instructions with no blocking feature
+
+    // reason -> number of instruction occurrences exhibiting it.
+    std::map<std::string, uint64_t> blockers;
+    // reason -> number of distinct bodies blocked (at least partly) by it.
+    std::map<std::string, uint64_t> blocking_bodies;
+};
+
+extern bool zam_cacheability_active();
+extern ZAMCacheabilityStats& zam_cacheability_stats();
+extern void zam_cacheability_report();
+
+// Returns true if 'reason' names a feature the analyzer should treat as
+// already handled by a hypothetical serializer (and thus NOT a blocker). The
+// set comes from the ZEEK_ZAM_CACHE_ASSUME environment variable: a
+// comma-separated list of exact reason labels (e.g. "type:record") or category
+// prefixes ending in ':' (e.g. "type:" or "aux:"). Lets the analyzer produce a
+// coverage curve as serializer capability grows.
+extern bool zam_cacheability_assumed(const std::string& reason);
 
 // RAII helper that charges its lifetime's wall-clock time to the named phase.
 // Cheap and inert when timing is not active. The 'phase' string must outlive

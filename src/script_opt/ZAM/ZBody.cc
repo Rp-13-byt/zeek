@@ -3,6 +3,8 @@
 #include "zeek/script_opt/ZAM/ZBody.h"
 
 #include <limits>
+#include <set>
+#include <string>
 
 #include "zeek/Conn.h"
 #include "zeek/Desc.h"
@@ -593,6 +595,109 @@ void ZBody::Dump() const {
         printf("%d: ", i);
         inst.Dump(stdout, i, &frame_denizens, "");
     }
+}
+
+void ZBody::AssessCacheability(ZAMCacheabilityStats& stats) const {
+    // Types whose constants/operands have a straightforward value
+    // representation and need no reference to a named or structured type to
+    // reconstruct. Everything else is counted (by tag) as a feature the
+    // serializer would have to handle.
+    auto is_simple_type = [](const TypePtr& t) -> bool {
+        if ( ! t )
+            return true;
+        switch ( t->Tag() ) {
+            case TYPE_VOID:
+            case TYPE_BOOL:
+            case TYPE_INT:
+            case TYPE_COUNT:
+            case TYPE_DOUBLE:
+            case TYPE_TIME:
+            case TYPE_INTERVAL:
+            case TYPE_STRING:
+            case TYPE_PATTERN:
+            case TYPE_PORT:
+            case TYPE_ADDR:
+            case TYPE_SUBNET: return true;
+            default: return false;
+        }
+    };
+
+    // Reasons that block this whole body (union across its instructions).
+    std::set<std::string> body_reasons;
+
+    for ( unsigned i = 0; i < end_pc; ++i ) {
+        auto& inst = insts[i];
+        ++stats.insts;
+
+        // Reasons blocking this single instruction (deduplicated). A reason is
+        // ignored if the hypothetical serializer is assumed to handle it.
+        std::set<std::string> inst_reasons;
+        auto note = [&](std::string reason) {
+            if ( ! zam_cacheability_assumed(reason) )
+                inst_reasons.insert(std::move(reason));
+        };
+        auto note_type = [&](const TypePtr& t) {
+            if ( ! is_simple_type(t) )
+                note(std::string("type:") + type_name(t->Tag()));
+        };
+        auto note_const = [&](const TypePtr& t) {
+            if ( ! is_simple_type(t) )
+                note(std::string("const:") + type_name(t->Tag()));
+        };
+
+        note_type(inst.GetType());
+        note_type(inst.GetType2());
+
+        if ( auto cv = inst.ConstVal() )
+            note_const(cv->GetType());
+
+        if ( auto aux = inst.aux ) {
+            if ( aux->lambda )
+                note("aux:lambda");
+            if ( aux->wi )
+                note("aux:when-info");
+            if ( aux->cat_args )
+                note("aux:cat-args");
+            if ( aux->id_val )
+                note("aux:id-val");
+            if ( aux->call_expr )
+                note("aux:call-expr");
+            if ( aux->func )
+                note("aux:direct-func");
+            if ( aux->event_handler )
+                note("aux:event-handler");
+            if ( aux->attrs )
+                note("aux:attrs");
+            if ( aux->field_inits )
+                note("aux:field-inits");
+
+            for ( auto& t : aux->types )
+                note_type(t);
+            note_type(aux->value_var_type);
+
+            for ( int e = 0; e < aux->n; ++e ) {
+                auto& elem = aux->elems[e];
+                note_type(elem.GetType());
+                if ( auto& c = elem.Constant() )
+                    note_const(c->GetType());
+            }
+        }
+
+        if ( inst_reasons.empty() )
+            ++stats.clean_insts;
+        else
+            for ( auto& r : inst_reasons ) {
+                ++stats.blockers[r];
+                body_reasons.insert(r);
+            }
+    }
+
+    ++stats.bodies;
+    if ( body_reasons.empty() )
+        ++stats.cacheable_bodies;
+    else
+        for ( auto& r : body_reasons )
+            ++stats.blocking_bodies[r];
 }
 
 void ZBody::StmtDescribe(ODesc* d) const {
