@@ -290,42 +290,53 @@ Landed:
   serializes + deserializes each serializable body and installs the
   reconstructed copy, so the existing btest baselines validate faithfulness.
 
+Also landed:
+- **Globals** serialized by name (re-resolved via `lookup_ID`).
+- **`ZInstAux` serialization (step 1)**: elems (slots/ints/atomic constants with
+  type hashes), the int-vector maps, type/is_managed vectors, loop vars,
+  value_var_type, the flags, the control-flow map, the `zvec` scratch size, and
+  the `id_val`/`func`/`event_handler` references (by name). Still gated:
+  `lambda`, `wi`, `cat_args`, `attrs`, `field_inits`, `call_expr`, and
+  record/vector-construction maps. This raised round-trip coverage of the base
+  corpus from ~1.6% to ~14.7% of bodies.
+- **On-disk store/load** (`ZAMBodyCache::Store`/`TryLoad`): each serializable
+  body is persisted to `ZEEK_ZAM_CACHE_DIR/zam-<key>.zbc` with a header (magic,
+  format version, build id, options hash, key); writes use temp-file + atomic
+  rename for safe concurrent access. `analyze_scripts_for_ZAM` loads before
+  compiling and installs on a hit (skipping `optimize_func`), storing on a miss.
+  The deserialization ctor runs the one-time ZAM runtime init so a pure
+  cache-hit run (which compiles nothing) is sound. The cache is disabled in
+  diagnostic modes (usage analysis, dumps, profiling).
+
 Validated:
-- Full `testing/btest/language/` suite under `-a zam` with verify mode:
-  **453/453 pass** (6 skipped), identical to the control run — every body the
-  serializer accepts round-trips and executes correctly.
-- Full base + protocol corpus under verify: clean run, no crashes; ~1.5-4.6% of
-  bodies currently serialize (the scalar/no-aux/no-globals tier), the rest
-  safely gated. This matches the analyzer's tier-A coverage and confirms the
-  machinery (type-by-hash, frame/instruction reconstruction, execution) before
-  coverage is widened.
+- `language/` and `core/` suites under `-a zam` with round-trip verify: **453/453
+  and 284/284 pass**, identical to control.
+- `language/` and `core/` run **cold (populating) then warm (pure cache-hit)**
+  over a shared cache dir: both passes **453/453** and **284/284** — the
+  load-and-install path that skips `optimize_func` is correct.
+
+Performance note: at the current ~14.7% body coverage the measured speedup is
+negligible — the cacheable bodies are the cheap ones, while the expensive
+call/record-bearing bodies are still gated and recompiled, and the `profile`
+and `inline` phases run regardless. The win materializes as coverage grows
+(see below); the ceiling is roughly the ~87% of per-process ZAM cost that is
+reduce/optimize-AST/use-defs/compile.
 
 Remaining (coverage growth + productization):
-- **Globals (by-name): done** — serialized by name, re-resolved via `lookup_ID`.
-  Coverage barely moved (20→21 bodies) because almost every body with globals
-  also has `aux` instructions, confirming aux is the real unlock.
-- **`ZInstAux` serialization — the next and largest increment** (the analyzer's
-  tier C→E, ~19%→~98%). Plan, in order:
-    1. Aux by-name refs (`id_val`, `func`, `event_handler`) + the plain fields
-       (`elems` as slot/int/atomic-const/type-hash, `map`/`rhs_map`/`lhs_map`,
-       `types`, `is_managed`, `loop_vars`, `value_var_type`, `is_BiF_call`,
-       `can_change_non_locals`, `cft`). Keep gating `lambda`, `wi`, `cat_args`,
-       `attrs`, `field_inits`, `call_expr`. Reaches ~19% of bodies.
-    2. Compact `call_expr` (location + call identity; full fidelity only where
-       trigger/`when` needs it) — the jump to ~84%.
-    3. Record constructors (`field_inits`, `attrs`, `cat_args`) — to ~98%.
-  **Hazard identified:** `ZInstAux` has runtime scratch vectors (`zvec`, `vv`)
-  that `Exec` indexes; `zvec` is sized to the target record's `NumFields()` for
-  record-construction ops (`Expr.cc:1363`), not derivable from the other aux
-  fields alone. Aux reconstruction must restore this op-specific scratch (or
-  gate the ops that need it), so this increment is invariant-laden and needs
-  careful, op-aware handling validated against btests.
+- **`call_expr` — the biggest remaining lever** (~19%→~84% of bodies). Used at
+  run time only as the frame's current-call for backtraces (`SetCall`) and as a
+  trigger/`when` memoization key (`trigger->Lookup`), so a reconstructed stand-in
+  carrying the call's location and a stable identity may suffice without full
+  AST serialization — to be confirmed.
+- **Record/vector constructors** (`field_inits`, `attrs`, `cat_args`, the
+  construction maps) — to ~98%. Note the `zvec`/`vv` runtime-scratch hazard:
+  `zvec` is pre-sized by the compiler (its size is already serialized), and
+  field-init default values may be pre-populated at compile time (so their
+  contents, not just the size, would need serializing).
 - Body-level structures still gated: switch case-maps, table/step iterators.
-- Disk file format + store/load/install wiring (currently only in-process
-  round-trip); the one-time global ZBody init done by the normal constructor
-  must be ensured on a pure cache-hit path.
 - A stronger `BuildId` (executable fingerprint, not just version string) and the
-  security hardening noted below before any default-on use.
+  security hardening noted below before any default-on use. Skipping `profile`
+  and `inline` on a full-cache-hit run is also a future optimization.
 
 ## Recommendation
 
