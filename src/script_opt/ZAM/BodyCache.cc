@@ -2,8 +2,11 @@
 
 #include "zeek/script_opt/ZAM/BodyCache.h"
 
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <set>
 #include <vector>
 
@@ -42,6 +45,12 @@ ZAMBodyCache::ZAMBodyCache() {
 }
 
 p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs& pfs) {
+    // Returns 0 ("no usable key") if any reachable body lacks a computed hash,
+    // so the caller treats the function as non-cacheable rather than keying on
+    // an incomplete fingerprint.
+    if ( ! pf->HasHashVal() )
+        return 0;
+
     std::set<p_hash_type> hashes; // sorted + deduplicated -> order-independent
     hashes.insert(pf->HashVal());
 
@@ -58,6 +67,8 @@ p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs
             auto it = pfs.FuncProfs().find(sf);
             if ( it == pfs.FuncProfs().end() )
                 continue; // e.g. a BiF or otherwise unprofiled; covered by BuildId
+            if ( ! it->second->HasHashVal() )
+                return 0; // can't form a complete key -> non-cacheable
             hashes.insert(it->second->HashVal());
             work.push_back(it->second.get());
         }
@@ -142,6 +153,14 @@ public:
     R(const char* p, size_t n) : cur(p), end(p + n) {}
     bool Ok() const { return ok; }
     bool AtEnd() const { return cur == end; }
+
+    // The unread remainder, consuming it. Used to take the body bytes that
+    // follow a cache-file header.
+    std::string rest() {
+        std::string s(cur, end - cur);
+        cur = end;
+        return s;
+    }
 
     uint8_t u8() { return read<uint8_t>(); }
     uint32_t u32() { return read<uint32_t>(); }
@@ -719,6 +738,72 @@ void zam_cache_verify_report() {
     fprintf(stderr, "# ZAM cache round-trip verify: %llu/%llu bodies serialized (%.1f%%), %llu gated\n",
             (unsigned long long)rt_ok, (unsigned long long)total,
             total ? 100.0 * static_cast<double>(rt_ok) / total : 0.0, (unsigned long long)rt_gated);
+}
+
+// ---- On-disk cache files ------------------------------------------------
+
+namespace {
+// Identifies a ZAM body cache file; bumped with ZAM_CACHE_FORMAT_VERSION below.
+constexpr uint32_t ZAM_CACHE_MAGIC = 0x5A42'4331; // "ZBC1"
+} // namespace
+
+std::string ZAMBodyCache::PathFor(p_hash_type key) const {
+    char name[32];
+    snprintf(name, sizeof name, "zam-%016llx.zbc", static_cast<unsigned long long>(key));
+    return dir + "/" + name;
+}
+
+void ZAMBodyCache::Store(p_hash_type key, const std::string& body) const {
+    if ( ! enabled )
+        return;
+
+    std::string buf;
+    W w(buf);
+    w.u32(ZAM_CACHE_MAGIC);
+    w.u32(ZAM_CACHE_FORMAT_VERSION);
+    w.u64(options_hash);
+    w.str(build_id);
+    w.u64(key);
+    buf += body; // the serialized body occupies the remainder of the file
+
+    // Write to a unique temp file, then atomically rename into place so a
+    // concurrent reader never sees a partial file. Same-key writes carry
+    // identical content, so a last-writer-wins rename is harmless.
+    auto final_path = PathFor(key);
+    auto tmp_path = final_path + ".tmp." + std::to_string(static_cast<long long>(getpid()));
+
+    {
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if ( ! out )
+            return;
+        out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+        if ( ! out )
+            return;
+    }
+
+    if ( std::rename(tmp_path.c_str(), final_path.c_str()) != 0 )
+        std::remove(tmp_path.c_str());
+}
+
+std::optional<std::string> ZAMBodyCache::TryLoad(p_hash_type key) const {
+    if ( ! enabled )
+        return std::nullopt;
+
+    std::ifstream in(PathFor(key), std::ios::binary);
+    if ( ! in )
+        return std::nullopt;
+
+    std::string buf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    R r(buf.data(), buf.size());
+    if ( r.u32() != ZAM_CACHE_MAGIC || r.u32() != ZAM_CACHE_FORMAT_VERSION || r.u64() != options_hash )
+        return std::nullopt;
+    if ( r.str() != build_id || r.u64() != key )
+        return std::nullopt;
+    if ( ! r.Ok() )
+        return std::nullopt;
+
+    return r.rest();
 }
 
 } // namespace zeek::detail

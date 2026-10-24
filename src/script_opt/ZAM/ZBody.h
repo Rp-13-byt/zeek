@@ -102,8 +102,9 @@ private:
 
     // Construct an empty body to be populated by ZBodySerializer during
     // deserialization from the on-disk cache. The counterpart to the normal
-    // ZAMCompiler-driven constructor.
-    explicit ZBody(std::string _func_name) : Stmt(STMT_ZAM) { func_name = std::move(_func_name); }
+    // ZAMCompiler-driven constructor; defined in ZBody.cc so it can run the
+    // same one-time ZAM runtime initialization.
+    explicit ZBody(std::string _func_name);
 
     auto Instructions() const { return insts; }
     auto NumInsts() const { return end_pc; }

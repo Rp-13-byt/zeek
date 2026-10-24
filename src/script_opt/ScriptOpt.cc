@@ -799,6 +799,15 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
 
     bool did_one = false;
 
+    ZAMBodyCache body_cache;
+
+    // The body cache skips compilation on a hit, which also skips compile-time
+    // diagnostics (usage warnings, dumps) and per-body profiling setup. Only
+    // use it for a plain optimizing run, never when those modes are requested.
+    const bool cache_modes_ok = analysis_options.usage_issues == 0 && ! analysis_options.dump_xform &&
+                                ! analysis_options.dump_uds && ! analysis_options.dump_ZAM &&
+                                ! analysis_options.dump_final_ZAM && ! analysis_options.profile_ZAM;
+
     for ( auto& f : funcs ) {
         if ( ! f.ShouldAnalyze() )
             continue;
@@ -818,12 +827,40 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
             continue;
         }
 
+        // Try the on-disk cache before compiling. The effective key is
+        // inlining-safe and cache entries are scoped to this build + options,
+        // so a hit yields a body identical to what compilation would produce.
+        p_hash_type cache_key = 0;
+        bool cache_enabled = body_cache.Enabled() && cache_modes_ok && f.Profile();
+        if ( cache_enabled ) {
+            cache_key = ZAMBodyCache::EffectiveKey(f.Profile(), *pfs);
+            cache_enabled = cache_key != 0; // 0 => no usable key, don't cache
+        }
+        if ( cache_enabled ) {
+            if ( auto bytes = body_cache.TryLoad(cache_key) )
+                if ( auto zb = ZBodySerializer::Deserialize(*bytes, *pfs) ) {
+                    func->ReplaceBody(f.Body(), zb);
+                    f.SetBody(zb);
+                    if ( is_lambda )
+                        l->second->ReplaceBody(zb);
+                    did_one = true;
+                    continue;
+                }
+        }
+
         auto new_body = f.Body();
         optimize_func(func, f.ProfilePtr(), pfs, f.Scope(), new_body);
         f.SetBody(new_body);
 
         if ( is_lambda )
             l->second->ReplaceBody(new_body);
+
+        // Populate the cache for next time, if the compiled body is serializable.
+        if ( cache_enabled && new_body && new_body->Tag() == STMT_ZAM ) {
+            std::string bytes;
+            if ( ZBodySerializer::Serialize(*static_cast<ZBody*>(new_body.get()), *pfs, bytes) )
+                body_cache.Store(cache_key, bytes);
+        }
 
         did_one = true;
     }

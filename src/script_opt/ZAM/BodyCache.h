@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "zeek/IntrusivePtr.h"
@@ -60,9 +61,20 @@ public:
     const std::string& BuildId() const { return build_id; }
     p_hash_type OptionsHash() const { return options_hash; }
 
+    // Return the serialized body stored for 'key', or nullopt if there is no
+    // entry or its header does not match this build and options. Never throws.
+    std::optional<std::string> TryLoad(p_hash_type key) const;
+
+    // Store serialized 'body' bytes for 'key', scoped by this build and
+    // options. Best-effort: write failures are silently ignored (a later run
+    // just recompiles). Uses a temp file + atomic rename so concurrent btest
+    // processes sharing a cache directory never observe a partial file.
+    void Store(p_hash_type key, const std::string& body) const;
+
 private:
     void ComputeBuildId();
     void ComputeOptionsHash();
+    std::string PathFor(p_hash_type key) const;
 
     bool enabled = false;
     std::string dir;
