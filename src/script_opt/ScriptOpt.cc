@@ -808,6 +808,21 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
                                 ! analysis_options.dump_uds && ! analysis_options.dump_ZAM &&
                                 ! analysis_options.dump_final_ZAM && ! analysis_options.profile_ZAM;
 
+    // Diagnostic (ZEEK_ZAM_CACHE_DEBUG): per-outcome body counts and compile
+    // time, to show where the remaining (uncached) compilation cost lies.
+    const bool cache_debug = body_cache.Enabled() && getenv("ZEEK_ZAM_CACHE_DEBUG");
+    std::map<std::string, std::pair<uint64_t, double>> cache_outcomes;
+    std::vector<std::pair<double, std::string>> uncached_costs;
+    auto note_outcome = [&](const char* outcome, double secs, const std::string& name) {
+        if ( ! cache_debug )
+            return;
+        auto& o = cache_outcomes[outcome];
+        ++o.first;
+        o.second += secs;
+        if ( std::string_view(outcome) != "hit" && std::string_view(outcome) != "stored" )
+            uncached_costs.emplace_back(secs, std::string(outcome) + " " + name);
+    };
+
     for ( auto& f : funcs ) {
         if ( ! f.ShouldAnalyze() )
             continue;
@@ -847,16 +862,20 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
                     f.SetBody(zb);
                     if ( is_lambda )
                         l->second->ReplaceBody(zb);
+                    note_outcome("hit", 0.0, func->GetName());
                     did_one = true;
                     continue;
                 }
         }
 
         auto logged_before = reporter->NumLogged();
+        auto compile_start = zam_now_secs();
 
         auto new_body = f.Body();
         optimize_func(func, f.ProfilePtr(), pfs, f.Scope(), new_body);
         f.SetBody(new_body);
+
+        auto compile_secs = zam_now_secs() - compile_start;
 
         if ( is_lambda )
             l->second->ReplaceBody(new_body);
@@ -865,13 +884,36 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
         // Skip bodies whose compilation emitted any diagnostic (e.g. constant-
         // folding warnings): a later cache hit skips compilation and would
         // silently drop that output.
-        if ( cache_enabled && new_body && new_body->Tag() == STMT_ZAM && reporter->NumLogged() == logged_before ) {
-            std::string bytes;
-            if ( ZBodySerializer::Serialize(*static_cast<ZBody*>(new_body.get()), *pfs, bytes) )
-                body_cache.Store(cache_key, bytes, func->FrameSize());
+        const char* outcome = "not-zam";
+        if ( ! cache_enabled )
+            outcome = "no-key";
+        else if ( new_body && new_body->Tag() == STMT_ZAM ) {
+            if ( reporter->NumLogged() != logged_before )
+                outcome = "diagnostics";
+            else {
+                std::string bytes;
+                const char* why = "not-serializable";
+                if ( ZBodySerializer::Serialize(*static_cast<ZBody*>(new_body.get()), *pfs, bytes, &why) ) {
+                    body_cache.Store(cache_key, bytes, func->FrameSize());
+                    outcome = "stored";
+                }
+                else
+                    outcome = why;
+            }
         }
+        note_outcome(outcome, compile_secs, func->GetName());
 
         did_one = true;
+    }
+
+    if ( cache_debug ) {
+        fprintf(stderr, "# ZAM body cache outcomes: outcome bodies compile-seconds\n");
+        for ( auto& [outcome, o] : cache_outcomes )
+            fprintf(stderr, "ZAM-cache-outcome %-18s %6llu %9.4f\n", outcome.c_str(),
+                    static_cast<unsigned long long>(o.first), o.second);
+        std::ranges::sort(uncached_costs, std::greater<>());
+        for ( size_t i = 0; i < uncached_costs.size() && i < 15; ++i )
+            fprintf(stderr, "ZAM-cache-uncached %9.4f %s\n", uncached_costs[i].first, uncached_costs[i].second.c_str());
     }
 
     if ( ! did_one )

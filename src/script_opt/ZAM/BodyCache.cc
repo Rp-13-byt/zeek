@@ -638,18 +638,27 @@ ExprPtr decode_expr(R& r, ProfileFuncs& pfs, bool& ok) {
 // serialization subset. Gates the AST-heavy members (handled in later roadmap
 // steps) and record/vector construction (whose runtime scratch, e.g. zvec, is
 // sized outside the serialized fields).
-bool aux_serializable(const ZInstAux* aux) {
+// Returns nullptr if serializable, otherwise a short reason naming the gate.
+const char* aux_unserializable_reason(const ZInstAux* aux) {
     if ( aux->call_expr && ! expr_serializable(aux->call_expr.get()) )
-        return false;
-    if ( aux->lambda || aux->wi || aux->cat_args || aux->attrs || aux->field_inits )
-        return false;
+        return "aux:call-expr-shape";
+    if ( aux->lambda )
+        return "aux:lambda";
+    if ( aux->wi )
+        return "aux:when-info";
+    if ( aux->cat_args )
+        return "aux:cat-args";
+    if ( aux->attrs )
+        return "aux:attrs";
+    if ( aux->field_inits )
+        return "aux:field-inits";
     if ( ! aux->map.empty() || ! aux->rhs_map.empty() || ! aux->lhs_map.empty() )
-        return false;
+        return "aux:maps";
     for ( int i = 0; i < aux->n; ++i )
         if ( const auto& c = aux->elems[i].Constant() )
             if ( ! supported_const(c) )
-                return false;
-    return true;
+                return "aux:const";
+    return nullptr;
 }
 
 void encode_int_vec(W& w, const std::vector<int>& v) {
@@ -848,15 +857,26 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
 
 } // namespace
 
-bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::string& out) {
+bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::string& out, const char** why) {
+    auto refuse = [why](const char* reason) {
+        if ( why )
+            *why = reason;
+        return false;
+    };
+
     // Capability gate: refuse bodies with structure we don't yet serialize.
     if ( ! body.int_cases.empty() || ! body.uint_cases.empty() || ! body.double_cases.empty() ||
-         ! body.str_cases.empty() || ! body.table_iters.empty() || body.num_step_iters != 0 )
-        return false;
+         ! body.str_cases.empty() )
+        return refuse("switch-cases");
+    if ( ! body.table_iters.empty() )
+        return refuse("table-iters");
+    if ( body.num_step_iters != 0 )
+        return refuse("step-iters");
 
     for ( unsigned i = 0; i < body.end_pc; ++i )
-        if ( body.insts[i].aux && ! aux_serializable(body.insts[i].aux) )
-            return false;
+        if ( body.insts[i].aux )
+            if ( auto reason = aux_unserializable_reason(body.insts[i].aux) )
+                return refuse(reason);
 
     W w(out);
     w.str(body.func_name);
@@ -896,7 +916,7 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
 
         auto cv = in.ConstVal();
         if ( cv && ! supported_const(cv) )
-            return false;
+            return refuse("const");
 
         w.u32(static_cast<uint32_t>(in.op));
         w.u32(static_cast<uint32_t>(in.op_type));
