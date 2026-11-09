@@ -950,7 +950,7 @@ std::string ZAMBodyCache::PathFor(p_hash_type key) const {
     return dir + "/" + name;
 }
 
-void ZAMBodyCache::Store(p_hash_type key, const std::string& body) const {
+void ZAMBodyCache::Store(p_hash_type key, const std::string& body, int frame_size) const {
     if ( ! enabled )
         return;
 
@@ -961,6 +961,7 @@ void ZAMBodyCache::Store(p_hash_type key, const std::string& body) const {
     w.u64(options_hash);
     w.str(build_id);
     w.u64(key);
+    w.i32(frame_size);
     buf += body; // the serialized body occupies the remainder of the file
 
     // Write to a unique temp file, then atomically rename into place so a
@@ -982,7 +983,7 @@ void ZAMBodyCache::Store(p_hash_type key, const std::string& body) const {
         std::remove(tmp_path.c_str());
 }
 
-std::optional<std::string> ZAMBodyCache::TryLoad(p_hash_type key) const {
+std::optional<ZAMBodyCache::Entry> ZAMBodyCache::TryLoad(p_hash_type key) const {
     if ( ! enabled )
         return std::nullopt;
 
@@ -997,10 +998,11 @@ std::optional<std::string> ZAMBodyCache::TryLoad(p_hash_type key) const {
         return std::nullopt;
     if ( r.str() != build_id || r.u64() != key )
         return std::nullopt;
-    if ( ! r.Ok() )
+    auto frame_size = r.i32();
+    if ( ! r.Ok() || frame_size < 0 )
         return std::nullopt;
 
-    return r.rest();
+    return Entry{r.rest(), frame_size};
 }
 
 } // namespace zeek::detail

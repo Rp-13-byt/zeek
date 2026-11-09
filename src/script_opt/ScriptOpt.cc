@@ -837,8 +837,12 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
             cache_enabled = cache_key != 0; // 0 => no usable key, don't cache
         }
         if ( cache_enabled ) {
-            if ( auto bytes = body_cache.TryLoad(cache_key) )
-                if ( auto zb = ZBodySerializer::Deserialize(*bytes, *pfs) ) {
+            if ( auto entry = body_cache.TryLoad(cache_key) )
+                if ( auto zb = ZBodySerializer::Deserialize(entry->body, *pfs) ) {
+                    // Compilation may enlarge the interpreter frame (for reducer
+                    // temporaries); a hit skips it, so restore the requirement.
+                    if ( entry->frame_size > func->FrameSize() )
+                        func->SetFrameSize(entry->frame_size);
                     func->ReplaceBody(f.Body(), zb);
                     f.SetBody(zb);
                     if ( is_lambda )
@@ -848,6 +852,8 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
                 }
         }
 
+        auto logged_before = reporter->NumLogged();
+
         auto new_body = f.Body();
         optimize_func(func, f.ProfilePtr(), pfs, f.Scope(), new_body);
         f.SetBody(new_body);
@@ -856,10 +862,13 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
             l->second->ReplaceBody(new_body);
 
         // Populate the cache for next time, if the compiled body is serializable.
-        if ( cache_enabled && new_body && new_body->Tag() == STMT_ZAM ) {
+        // Skip bodies whose compilation emitted any diagnostic (e.g. constant-
+        // folding warnings): a later cache hit skips compilation and would
+        // silently drop that output.
+        if ( cache_enabled && new_body && new_body->Tag() == STMT_ZAM && reporter->NumLogged() == logged_before ) {
             std::string bytes;
             if ( ZBodySerializer::Serialize(*static_cast<ZBody*>(new_body.get()), *pfs, bytes) )
-                body_cache.Store(cache_key, bytes);
+                body_cache.Store(cache_key, bytes, func->FrameSize());
         }
 
         did_one = true;
