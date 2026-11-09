@@ -8,8 +8,12 @@
 #include <cstring>
 #include <fstream>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "zeek/Attr.h"
+#include "zeek/Desc.h"
 #include "zeek/EventHandler.h"
 #include "zeek/EventRegistry.h"
 #include "zeek/Func.h"
@@ -44,6 +48,197 @@ ZAMBodyCache::ZAMBodyCache() {
     ComputeOptionsHash();
 }
 
+// ---- Compile-environment fingerprint --------------------------------------
+//
+// A function's profile hash covers its own source, but its compiled ZAM body
+// also depends on the environment it was compiled in, which differs between
+// processes that load different scripts:
+//   - record layouts: the profile type-hash covers only a record's original
+//     fields, while ZAM hardwires field offsets and fields added via
+//     "redef record ... +=" land at load-order-dependent offsets;
+//   - enum values: redef-extensible enums (e.g. Log::ID) get load-order-dependent
+//     integers, and instructions embed those integers;
+//   - field/type attributes (&optional, &default, ...), which affect codegen;
+//   - values of redef'able global constants, which the optimizer may fold.
+// The fingerprint below captures all of these so that two processes only share
+// a cache entry when the body would compile identically in both.
+
+namespace {
+
+p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_type>& memo,
+                          std::unordered_set<const Type*>& active);
+
+p_hash_type env_attrs_hash(const Attributes* attrs) {
+    if ( ! attrs )
+        return 0;
+    ODesc d;
+    attrs->Describe(&d);
+    return p_hash(std::string_view(d.Description()));
+}
+
+p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_type>& memo,
+                          std::unordered_set<const Type*>& active) {
+    if ( ! t )
+        return 0;
+    if ( auto it = memo.find(t); it != memo.end() )
+        return it->second;
+
+    p_hash_type h = merge_p_hashes(p_hash(static_cast<int>(t->Tag())), p_hash(std::string_view(t->GetName())));
+
+    // Recursive types: within an in-progress traversal, refer to the type by
+    // tag + name only (its full structure is accounted for by the outer visit).
+    if ( ! active.insert(t).second )
+        return h;
+
+    auto sub = [&](const Type* st) { h = merge_p_hashes(h, env_type_hash(st, memo, active)); };
+
+    switch ( t->Tag() ) {
+        case TYPE_RECORD: {
+            auto rt = t->AsRecordType();
+            h = merge_p_hashes(h, p_hash(rt->NumFields()));
+            for ( int i = 0; i < rt->NumFields(); ++i ) {
+                auto fd = rt->FieldDecl(i);
+                h = merge_p_hashes(h, p_hash(std::string_view(fd->id)));
+                sub(fd->type.get());
+                h = merge_p_hashes(h, env_attrs_hash(fd->attrs.get()));
+            }
+        } break;
+        case TYPE_ENUM:
+            for ( auto& [name, val] : t->AsEnumType()->Names() ) {
+                h = merge_p_hashes(h, p_hash(std::string_view(name)));
+                h = merge_p_hashes(h, p_hash(static_cast<int>(val)));
+            }
+            break;
+        case TYPE_TABLE:
+            sub(t->AsTableType()->GetIndices().get());
+            sub(t->AsTableType()->Yield().get());
+            break;
+        case TYPE_FUNC: {
+            auto ft = t->AsFuncType();
+            h = merge_p_hashes(h, p_hash(static_cast<int>(ft->Flavor())));
+            sub(ft->Params().get());
+            sub(ft->Yield().get());
+        } break;
+        case TYPE_LIST:
+            for ( auto& lt : t->AsTypeList()->GetTypes() )
+                sub(lt.get());
+            break;
+        case TYPE_VECTOR: sub(t->AsVectorType()->Yield().get()); break;
+        case TYPE_FILE: sub(t->AsFileType()->Yield().get()); break;
+        case TYPE_TYPE: sub(t->AsTypeType()->GetType().get()); break;
+        default: break;
+    }
+
+    active.erase(t);
+    memo[t] = h;
+    return h;
+}
+
+// Hash of a (global constant's) value that is stable across processes. Plain
+// Describe() is not: table iteration order depends on the per-process hash
+// seed, and lambda names are randomized. So containers are hashed structurally,
+// with table/set entries combined order-independently.
+p_hash_type env_value_hash(const Val* v, int depth = 0) {
+    if ( ! v )
+        return 0;
+
+    auto tag = v->GetType()->Tag();
+    p_hash_type h = p_hash(static_cast<int>(tag));
+
+    if ( depth > 64 )
+        return h; // pathological nesting; tag-only is still a valid (coarser) key
+
+    switch ( tag ) {
+        case TYPE_TABLE: {
+            std::multiset<p_hash_type> entries;
+            for ( auto& [k, val] : v->AsTableVal()->ToMap() )
+                entries.insert(
+                    merge_p_hashes(env_value_hash(k.get(), depth + 1), env_value_hash(val.get(), depth + 1)));
+            for ( auto e : entries )
+                h = merge_p_hashes(h, e);
+        } break;
+        case TYPE_RECORD: {
+            auto rv = v->AsRecordVal();
+            for ( int i = 0; i < rv->NumFields(); ++i )
+                h = merge_p_hashes(h, env_value_hash(rv->GetField(i).get(), depth + 1));
+        } break;
+        case TYPE_VECTOR: {
+            auto vv = v->AsVectorVal();
+            for ( unsigned int i = 0; i < vv->Size(); ++i )
+                h = merge_p_hashes(h, env_value_hash(vv->ValAt(i).get(), depth + 1));
+        } break;
+        case TYPE_LIST:
+            for ( auto& e : v->AsListVal()->Vals() )
+                h = merge_p_hashes(h, env_value_hash(e.get(), depth + 1));
+            break;
+        case TYPE_FUNC: {
+            const auto& name = v->AsFunc()->GetName();
+            if ( ! name.starts_with("lambda_") )
+                h = merge_p_hashes(h, p_hash(std::string_view(name)));
+        } break;
+        case TYPE_OPAQUE:
+        case TYPE_FILE:
+        case TYPE_ANY: break;
+        default: {
+            ODesc d;
+            v->Describe(&d);
+            h = merge_p_hashes(h, p_hash(std::string_view(d.Description())));
+        } break;
+    }
+
+    return h;
+}
+
+// Fingerprint of the environment a single profiled body compiles against.
+p_hash_type env_fingerprint(const ProfileFunc* pf) {
+    // Memoized across calls within a run; types and global values are fixed
+    // by the time ZAM compilation happens.
+    static std::unordered_map<const Type*, p_hash_type> type_memo;
+    static std::unordered_map<const ID*, p_hash_type> global_memo;
+    std::unordered_set<const Type*> active;
+
+    std::set<p_hash_type> parts;
+    for ( auto t : pf->OrderedTypes() )
+        parts.insert(env_type_hash(t, type_memo, active));
+
+    for ( auto& g : pf->AllGlobals() ) {
+        auto [it, inserted] = global_memo.emplace(g.get(), 0);
+        if ( inserted ) {
+            p_hash_type gh = merge_p_hashes(p_hash(std::string_view(g->Name())), p_hash(g->IsConst() ? 1 : 0));
+            gh = merge_p_hashes(gh, env_type_hash(g->GetType().get(), type_memo, active));
+            gh = merge_p_hashes(gh, env_attrs_hash(g->GetAttrs().get()));
+            if ( g->IsConst() && g->GetVal() )
+                gh = merge_p_hashes(gh, env_value_hash(g->GetVal().get()));
+            it->second = gh;
+        }
+        parts.insert(it->second);
+    }
+
+    // Source locations are observable at run time (error messages, backtraces,
+    // profiles) but are not part of the profile hash, so textually identical
+    // bodies at different lines or in different files would otherwise collide.
+    // Fold in every statement's and expression's location, in traversal order.
+    auto loc_hash = [](const Obj* o) {
+        auto l = o->GetLocationInfo();
+        p_hash_type lh = p_hash(std::string_view(l && l->FileName() ? l->FileName() : ""));
+        lh = merge_p_hashes(lh, p_hash(l ? l->FirstLine() : 0));
+        return merge_p_hashes(lh, p_hash(l ? l->LastLine() : 0));
+    };
+    p_hash_type locs = p_hash("locs");
+    for ( auto& st : pf->Stmts() )
+        locs = merge_p_hashes(locs, loc_hash(st.get()));
+    for ( auto& e : pf->Exprs() )
+        locs = merge_p_hashes(locs, loc_hash(e.get()));
+    parts.insert(locs);
+
+    p_hash_type h = p_hash("env");
+    for ( auto x : parts )
+        h = merge_p_hashes(h, x);
+    return h;
+}
+
+} // namespace
+
 p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs& pfs) {
     // Returns 0 ("no usable key") if any reachable body lacks a computed hash,
     // so the caller treats the function as non-cacheable rather than keying on
@@ -53,6 +248,7 @@ p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs
 
     std::set<p_hash_type> hashes; // sorted + deduplicated -> order-independent
     hashes.insert(pf->HashVal());
+    hashes.insert(env_fingerprint(pf));
 
     std::unordered_set<const ScriptFunc*> seen;
     std::vector<const ProfileFunc*> work{pf};
@@ -70,6 +266,7 @@ p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs
             if ( ! it->second->HasHashVal() )
                 return 0; // can't form a complete key -> non-cacheable
             hashes.insert(it->second->HashVal());
+            hashes.insert(env_fingerprint(it->second.get()));
             work.push_back(it->second.get());
         }
     }
