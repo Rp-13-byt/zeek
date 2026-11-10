@@ -35,7 +35,7 @@ using ZBodyPtr = IntrusivePtr<ZBody>;
 
 // Bump whenever the on-disk format or any ZAM encoding detail changes, so old
 // cache files are rejected rather than misread.
-constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 5;
+constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 6;
 
 class ZAMBodyCache {
 public:
@@ -104,6 +104,11 @@ public:
     // the same scripts) to resolve types by hash. Returns nullptr on any
     // malformed input or unresolvable reference.
     static ZBodyPtr Deserialize(const std::string& in, ProfileFuncs& pfs);
+
+    // Round-trip self-check: with ZEEK_ZAM_CACHE_VERIFY_LOG naming a file,
+    // append any non-equivalent difference between a compiled body and its
+    // reconstruction to that file. See BodyCache.cc.
+    static void VerifyStructure(const ZBody& orig, const ZBody& reconstructed);
 };
 
 // Round-trip self-verification (env-gated by ZEEK_ZAM_CACHE_VERIFY): if 'orig'

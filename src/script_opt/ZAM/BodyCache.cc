@@ -30,6 +30,7 @@
 #include "zeek/script_opt/ZAM/ZBody.h"
 #include "zeek/script_opt/ZAM/ZInst.h"
 #include "zeek/script_opt/ZAM/ZInstAux.h"
+#include "zeek/script_opt/ZAM/ZOp.h"
 
 namespace zeek {
 extern const char* zeek_version();
@@ -124,7 +125,11 @@ p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_
             for ( auto& lt : t->AsTypeList()->GetTypes() )
                 sub(lt.get());
             break;
-        case TYPE_VECTOR: sub(t->AsVectorType()->Yield().get()); break;
+        case TYPE_VECTOR:
+            // Yield() reports "any" for unspecified vectors too; keep them distinct.
+            h = merge_p_hashes(h, p_hash(t->AsVectorType()->IsUnspecifiedVector() ? 1 : 0));
+            sub(t->AsVectorType()->Yield().get());
+            break;
         case TYPE_FILE: sub(t->AsFileType()->Yield().get()); break;
         case TYPE_TYPE: sub(t->AsTypeType()->GetType().get()); break;
         default: break;
@@ -325,6 +330,14 @@ std::set<std::string>& filename_pool() {
     return pool;
 }
 
+// Resolve a global identifier by its (fully qualified) name directly in the
+// global scope. Deliberately not lookup_ID(), which searches the active scope
+// stack innermost-first and so could bind to a same-named local if a body is
+// deserialized while a function scope is pushed.
+IDPtr resolve_global(const std::string& name) {
+    return global_scope()->Find(make_full_var_name(GLOBAL_MODULE_NAME, name.c_str()));
+}
+
 // Little binary writer appending to a std::string.
 class W {
 public:
@@ -396,8 +409,8 @@ private:
 };
 
 // Atomic Val tags we can serialize. Anything else makes a body non-cacheable.
-bool supported_const(const ValPtr& v) {
-    switch ( v->GetType()->Tag() ) {
+bool supported_const_type(TypeTag tag) {
+    switch ( tag ) {
         case TYPE_BOOL:
         case TYPE_INT:
         case TYPE_COUNT:
@@ -413,9 +426,40 @@ bool supported_const(const ValPtr& v) {
     }
 }
 
+bool supported_const(const ValPtr& v) { return supported_const_type(v->GetType()->Tag()); }
+
+// Types are encoded as their profile type-hash and resolved on load to the
+// live representative type for that hash. The profile hash doesn't distinguish
+// an unspecified vector ("vector()", internally yield void) from "vector of
+// any" (VectorType::Yield() reports any for both), so that flag is carried
+// alongside and must match.
+bool is_unspecified_vector(const Type* t) {
+    return t && t->Tag() == TYPE_VECTOR && t->AsVectorType()->IsUnspecifiedVector();
+}
+
+void encode_type(W& w, ProfileFuncs& pfs, const Type* t) {
+    w.u64(t ? pfs.HashType(t) : 0);
+    w.u8(is_unspecified_vector(t) ? 1 : 0);
+}
+
+// Returns null for "no type". A non-null type that can't be resolved exactly
+// sets ok=false (so the body is a cache miss) rather than being dropped.
+TypePtr decode_type(R& r, ProfileFuncs& pfs, bool& ok) {
+    auto h = r.u64();
+    bool unspecified = r.u8() != 0;
+    if ( h == 0 )
+        return nullptr;
+    auto rep = pfs.TypeForHash(h);
+    if ( ! rep || is_unspecified_vector(rep) != unspecified ) {
+        ok = false;
+        return nullptr;
+    }
+    return {NewRef{}, const_cast<Type*>(rep)};
+}
+
 void encode_val(W& w, ProfileFuncs& pfs, const ValPtr& v) {
     auto t = v->GetType();
-    w.u64(pfs.HashType(t));
+    encode_type(w, pfs, t.get());
     w.u32(static_cast<uint32_t>(t->Tag()));
 
     switch ( t->Tag() ) {
@@ -441,20 +485,10 @@ void encode_val(W& w, ProfileFuncs& pfs, const ValPtr& v) {
     }
 }
 
-// Resolve a type hash to a live TypePtr in this process. 0 -> null.
-TypePtr resolve_type(ProfileFuncs& pfs, p_hash_type h) {
-    if ( h == 0 )
-        return nullptr;
-    auto rep = pfs.TypeForHash(h);
-    if ( ! rep )
-        return nullptr;
-    return {NewRef{}, const_cast<Type*>(rep)};
-}
 
 ValPtr decode_val(R& r, ProfileFuncs& pfs, bool& ok) {
-    auto hash = r.u64();
+    auto type = decode_type(r, pfs, ok);
     auto tag = static_cast<TypeTag>(r.u32());
-    auto type = resolve_type(pfs, hash);
     if ( ! r.Ok() || ! type ) {
         ok = false;
         return nullptr;
@@ -533,13 +567,17 @@ void set_loc(R& r, Obj* o) {
 }
 
 void encode_expr(W& w, ProfileFuncs& pfs, const Expr* e) {
+    // Parenthesization is part of how an expression renders (e.g. "(f(x))"
+    // in error messages), so carry it for every reconstructed expression.
+    w.u8(e->IsParen() ? 1 : 0);
+
     switch ( e->Tag() ) {
         case EXPR_NAME: {
             w.u8(1);
             auto id = e->AsNameExpr()->Id();
             w.u8(id->IsGlobal() ? 1 : 0);
             w.str(id->Name());
-            w.u64(pfs.HashType(id->GetType()));
+            encode_type(w, pfs, id->GetType().get());
         } break;
         case EXPR_CONST:
             w.u8(2);
@@ -564,19 +602,29 @@ void encode_expr(W& w, ProfileFuncs& pfs, const Expr* e) {
     }
 }
 
+ExprPtr decode_expr_body(R& r, ProfileFuncs& pfs, bool& ok);
+
 ExprPtr decode_expr(R& r, ProfileFuncs& pfs, bool& ok) {
+    bool paren = r.u8() != 0;
+    auto e = decode_expr_body(r, pfs, ok);
+    if ( e && paren )
+        e->MarkParen();
+    return e;
+}
+
+ExprPtr decode_expr_body(R& r, ProfileFuncs& pfs, bool& ok) {
     switch ( r.u8() ) {
         case 1: { // NameExpr
             bool is_global = r.u8() != 0;
             auto name = r.str();
-            auto t = resolve_type(pfs, r.u64());
-            if ( ! r.Ok() ) {
+            auto t = decode_type(r, pfs, ok);
+            if ( ! r.Ok() || ! ok ) {
                 ok = false;
                 return nullptr;
             }
             IDPtr id;
             if ( is_global )
-                id = lookup_ID(name.c_str(), GLOBAL_MODULE_NAME, false, false, false);
+                id = resolve_global(name);
             if ( ! id ) {
                 // A local (or a global no longer present): synthesize an ID that
                 // carries the name and type so Describe renders faithfully. The
@@ -676,6 +724,40 @@ void rebuild_cat_args(ZInstAux* aux) {
     }
 }
 
+// Whether an op reads its instruction's constant slot 'c' at run time. An
+// instruction's op_type doesn't reliably say so: optimized built-ins construct
+// the instruction with a slot-only op_type and then assign 'c' directly. So
+// consult the op's generated description: a 'C' in its declared operand class,
+// or a reference to z.c in its evaluation code. Unknown ops are treated as
+// possibly reading it.
+bool op_reads_constant(ZOp op) {
+    auto it = zam_inst_desc.find(op);
+    if ( it == zam_inst_desc.end() )
+        return true;
+    return it->second.op_class.find('C') != std::string::npos || it->second.op_eval.find("z.c") != std::string::npos;
+}
+
+// Reinterpret an instruction's raw constant slot as a value, using the
+// instruction's type (which is how the compiler builds it: ZVal(v, t) followed
+// by SetType(t)). Since ZVal is an untyped union, validate the result rather
+// than trust the type: it must be a supported atomic value whose dynamic type
+// matches, and for unmanaged types re-encoding it must reproduce 'c' exactly.
+// Returns nullptr if any check fails.
+ValPtr constant_slot_value(const ZInst& in) {
+    const auto& t = in.GetType();
+    if ( ! t || ! supported_const_type(t->Tag()) )
+        return nullptr;
+    auto v = in.c.ToVal(t);
+    if ( ! v || v->GetType()->Tag() != t->Tag() )
+        return nullptr;
+    if ( ! ZVal::IsManagedType(t) ) {
+        ZVal re(v, t);
+        if ( std::memcmp(&re, &in.c, sizeof(ZVal)) != 0 )
+            return nullptr;
+    }
+    return v;
+}
+
 // Switch statements: each CaseMaps<T> is a vector (one per switch) of maps
 // from case value to instruction number, so they serialize directly.
 template<typename T, typename EncodeKey>
@@ -748,7 +830,7 @@ void encode_aux(W& w, ProfileFuncs& pfs, const ZInstAux* aux) {
         else if ( e.GetType() ) {
             w.u8(1); // frame slot with type
             w.i32(e.Slot());
-            w.u64(pfs.HashType(e.GetType()));
+            encode_type(w, pfs, e.GetType().get());
         }
         else {
             w.u8(0); // plain integer
@@ -763,13 +845,13 @@ void encode_aux(W& w, ProfileFuncs& pfs, const ZInstAux* aux) {
 
     w.u32(static_cast<uint32_t>(aux->types.size()));
     for ( auto& t : aux->types )
-        w.u64(pfs.HashType(t));
+        encode_type(w, pfs, t.get());
 
     w.u32(static_cast<uint32_t>(aux->is_managed.size()));
     for ( bool b : aux->is_managed )
         w.u8(b ? 1 : 0);
 
-    w.u64(pfs.HashType(aux->value_var_type));
+    encode_type(w, pfs, aux->value_var_type.get());
 
     w.u8(aux->is_BiF_call ? 1 : 0);
     w.u8(aux->can_change_non_locals ? 1 : 0);
@@ -811,6 +893,7 @@ void encode_aux(W& w, ProfileFuncs& pfs, const ZInstAux* aux) {
 
     w.u8(aux->cat_args ? 1 : 0);
 
+
     // The zvec runtime-scratch vector is pre-sized by the compiler (e.g. to a
     // record's field count for record constructors) and indexed during Exec;
     // its size is part of the body's state, so serialize it faithfully. Its
@@ -837,7 +920,7 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
         }
         else if ( kind == 1 ) {
             auto slot = r.i32();
-            auto t = resolve_type(pfs, r.u64());
+            auto t = decode_type(r, pfs, ok);
             if ( ! t )
                 ok = false;
             else
@@ -859,7 +942,7 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
 
     auto n_types = r.u32();
     for ( uint32_t j = 0; j < n_types && r.Ok() && ok; ++j ) {
-        auto t = resolve_type(pfs, r.u64());
+        auto t = decode_type(r, pfs, ok);
         if ( ! t )
             ok = false;
         else
@@ -870,8 +953,7 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
     for ( uint32_t j = 0; j < n_managed && r.Ok(); ++j )
         aux->is_managed.push_back(r.u8() != 0);
 
-    if ( auto h = r.u64() )
-        aux->value_var_type = resolve_type(pfs, h);
+    aux->value_var_type = decode_type(r, pfs, ok);
 
     aux->is_BiF_call = r.u8() != 0;
     aux->can_change_non_locals = r.u8() != 0;
@@ -884,7 +966,7 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
 
     if ( r.u8() == 1 ) {
         auto name = r.str();
-        auto id = lookup_ID(name.c_str(), GLOBAL_MODULE_NAME, false, false, false);
+        auto id = resolve_global(name);
         if ( ! id )
             ok = false;
         else
@@ -916,6 +998,7 @@ ZInstAux* decode_aux(R& r, ProfileFuncs& pfs, bool& ok) {
     }
 
     bool has_cat_args = r.u8() != 0;
+
 
     // Restore the compiler-set size of the zvec runtime-scratch vector.
     aux->zvec.resize(r.u32());
@@ -950,9 +1033,10 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
     // Capability gate: refuse bodies with structure we don't yet serialize.
 
     for ( unsigned i = 0; i < body.end_pc; ++i )
-        if ( body.insts[i].aux )
-            if ( auto reason = aux_unserializable_reason(body.insts[i].aux) )
+        if ( auto aux = body.insts[i].aux ) {
+            if ( auto reason = aux_unserializable_reason(aux) )
                 return refuse(reason);
+        }
 
     W w(out);
     w.str(body.func_name);
@@ -1003,6 +1087,13 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
         auto& in = body.insts[i];
 
         auto cv = in.ConstVal();
+        if ( ! cv && op_reads_constant(in.op) ) {
+            // Some ops (notably optimized built-ins) keep a constant in 'c'
+            // without an op_type that says so; capture it explicitly.
+            cv = constant_slot_value(in);
+            if ( ! cv )
+                return refuse("const-slot");
+        }
         if ( cv && ! supported_const(cv) )
             return refuse("const");
 
@@ -1012,8 +1103,8 @@ bool ZBodySerializer::Serialize(const ZBody& body, ProfileFuncs& pfs, std::strin
         w.i32(in.v2);
         w.i32(in.v3);
         w.i32(in.v4);
-        w.u64(pfs.HashType(in.GetType()));
-        w.u64(pfs.HashType(in.GetType2()));
+        encode_type(w, pfs, in.GetType().get());
+        encode_type(w, pfs, in.GetType2().get());
 
         // is_managed: 0 = unset, 1 = false, 2 = true.
         w.u8(! in.is_managed ? 0 : (*in.is_managed ? 2 : 1));
@@ -1083,7 +1174,7 @@ ZBodyPtr ZBodySerializer::Deserialize(const std::string& in, ProfileFuncs& pfs) 
         auto slot = r.i32();
         if ( ! r.Ok() )
             break;
-        auto id = lookup_ID(name.c_str(), GLOBAL_MODULE_NAME, false, false, false);
+        auto id = resolve_global(name);
         if ( ! id )
             return nullptr; // global no longer present -> safe miss
         zb->globals.push_back(GlobalInfo{id, slot});
@@ -1122,14 +1213,17 @@ ZBodyPtr ZBodySerializer::Deserialize(const std::string& in, ProfileFuncs& pfs) 
         auto op = static_cast<ZOp>(r.u32());
         auto op_type = static_cast<ZAMOpType>(r.u32());
 
-        ZInstI zi(op, op_type);
+        // Note: not "ZInstI zi(op, op_type)", which would resolve to the
+        // ZInstI(ZOp, int v1) constructor and silently set op_type to OP_V.
+        ZInstI zi(op);
+        zi.op_type = op_type;
         zi.v1 = r.i32();
         zi.v2 = r.i32();
         zi.v3 = r.i32();
         zi.v4 = r.i32();
 
-        auto t = resolve_type(pfs, r.u64());
-        auto t2 = resolve_type(pfs, r.u64());
+        auto t = decode_type(r, pfs, ok);
+        auto t2 = decode_type(r, pfs, ok);
         if ( t )
             zi.SetType(t);
         if ( t2 )
@@ -1191,6 +1285,138 @@ ZBodyPtr ZBodySerializer::Deserialize(const std::string& in, ProfileFuncs& pfs) 
     return zb;
 }
 
+// Structural self-check for round-trip verification (ZEEK_ZAM_CACHE_VERIFY_LOG):
+// compares every field of a compiled body against its reconstruction and
+// appends any difference to the named file. This is independent of whether a
+// test happens to exercise the affected code, so it catches reconstruction
+// errors that btest baselines can miss. Types may legitimately differ by
+// identity (they resolve to the representative for their hash), so only
+// non-equivalent types are reported.
+void ZBodySerializer::VerifyStructure(const ZBody& a, const ZBody& b) {
+    static FILE* log = [] {
+        auto path = getenv("ZEEK_ZAM_CACHE_VERIFY_LOG");
+        return path ? fopen(path, "a") : nullptr;
+    }();
+    if ( ! log )
+        return;
+
+    auto report = [&](const char* what, int i) { fprintf(log, "%s inst=%d %s\n", a.func_name.c_str(), i, what); };
+
+    auto equiv_type = [](const TypePtr& x, const TypePtr& y) {
+        if ( x == y )
+            return true;
+        if ( ! x || ! y )
+            return false;
+        return x->GetName() == y->GetName() && is_unspecified_vector(x.get()) == is_unspecified_vector(y.get()) &&
+               same_type(*x, *y, false, true);
+    };
+
+    auto val_desc = [](const ValPtr& v) -> std::string {
+        if ( ! v )
+            return "<nil>";
+        ODesc d;
+        v->Describe(&d);
+        return d.Description();
+    };
+
+    if ( a.frame_size != b.frame_size )
+        report("frame_size", -1);
+    if ( (a.fixed_frame != nullptr) != (b.fixed_frame != nullptr) )
+        report("fixed_frame", -1);
+    if ( a.managed_slots != b.managed_slots )
+        report("managed_slots", -1);
+    if ( a.globals.size() != b.globals.size() || a.num_globals != b.num_globals )
+        report("globals", -1);
+    else
+        for ( size_t g = 0; g < a.globals.size(); ++g )
+            if ( a.globals[g].id != b.globals[g].id || a.globals[g].slot != b.globals[g].slot )
+                report("globals", static_cast<int>(g));
+    if ( a.table_iters.size() != b.table_iters.size() || a.num_step_iters != b.num_step_iters )
+        report("iterators", -1);
+    if ( a.int_cases != b.int_cases || a.uint_cases != b.uint_cases || a.double_cases != b.double_cases ||
+         a.str_cases != b.str_cases )
+        report("case-maps", -1);
+    if ( a.end_pc != b.end_pc ) {
+        report("end_pc", -1);
+        return;
+    }
+
+    for ( unsigned i = 0; i < a.end_pc; ++i ) {
+        const auto& x = a.insts[i];
+        const auto& y = b.insts[i];
+        int n = static_cast<int>(i);
+
+        if ( x.op != y.op || x.op_type != y.op_type )
+            report("op", n);
+        if ( x.v1 != y.v1 || x.v2 != y.v2 || x.v3 != y.v3 || x.v4 != y.v4 )
+            report("operands", n);
+        if ( ! equiv_type(x.GetType(), y.GetType()) || ! equiv_type(x.GetType2(), y.GetType2()) )
+            report("type", n);
+        if ( x.is_managed != y.is_managed )
+            report("is_managed", n);
+        if ( val_desc(x.ConstVal()) != val_desc(y.ConstVal()) )
+            report("constant", n);
+        if ( op_reads_constant(x.op) && x.GetType() && ! ZVal::IsManagedType(x.GetType()) &&
+             std::memcmp(&x.c, &y.c, sizeof(ZVal)) != 0 )
+            report("constant-slot", n);
+
+        if ( (x.aux != nullptr) != (y.aux != nullptr) ) {
+            report("aux", n);
+            continue;
+        }
+        if ( ! x.aux )
+            continue;
+
+        auto xa = x.aux;
+        auto ya = y.aux;
+        if ( xa->n != ya->n ) {
+            report("aux.n", n);
+            continue;
+        }
+        for ( int e = 0; e < xa->n; ++e ) {
+            const auto& ex = xa->elems[e];
+            const auto& ey = ya->elems[e];
+            if ( ex.Slot() != ey.Slot() || ex.IsManaged() != ey.IsManaged() ||
+                 ! equiv_type(ex.GetType(), ey.GetType()) || val_desc(ex.Constant()) != val_desc(ey.Constant()) )
+                report("aux.elem", n);
+        }
+        if ( xa->elems_has_slots != ya->elems_has_slots || xa->map != ya->map || xa->rhs_map != ya->rhs_map ||
+             xa->lhs_map != ya->lhs_map || xa->loop_vars != ya->loop_vars || xa->is_managed != ya->is_managed ||
+             xa->zvec.size() != ya->zvec.size() )
+            report("aux.vectors", n);
+        if ( xa->types.size() != ya->types.size() )
+            report("aux.types", n);
+        else
+            for ( size_t k = 0; k < xa->types.size(); ++k )
+                if ( ! equiv_type(xa->types[k], ya->types[k]) )
+                    report("aux.types", n);
+        if ( ! equiv_type(xa->value_var_type, ya->value_var_type) )
+            report("aux.value_var_type", n);
+        if ( xa->is_BiF_call != ya->is_BiF_call || xa->can_change_non_locals != ya->can_change_non_locals ||
+             xa->cft != ya->cft )
+            report("aux.flags", n);
+        if ( xa->id_val != ya->id_val || xa->func != ya->func || xa->event_handler != ya->event_handler )
+            report("aux.refs", n);
+        if ( (xa->field_inits != nullptr) != (ya->field_inits != nullptr) ||
+             (xa->field_inits && *xa->field_inits != *ya->field_inits) )
+            report("aux.field_inits", n);
+        if ( (xa->cat_args != nullptr) != (ya->cat_args != nullptr) )
+            report("aux.cat_args", n);
+        if ( (xa->call_expr != nullptr) != (ya->call_expr != nullptr) )
+            report("aux.call_expr", n);
+        else if ( xa->call_expr ) {
+            ODesc dx, dy;
+            xa->call_expr->Describe(&dx);
+            ya->call_expr->Describe(&dy);
+            if ( std::string(dx.Description()) != dy.Description() )
+                fprintf(log, "%s inst=%d aux.call_expr orig=[%s] reconstructed=[%s]\n", a.func_name.c_str(), n,
+                        dx.Description(), dy.Description());
+        }
+    }
+
+    fflush(log);
+}
+
 bool zam_cache_verify_active() {
     static const bool active = getenv("ZEEK_ZAM_CACHE_VERIFY") != nullptr;
     return active;
@@ -1206,6 +1432,8 @@ ZBodyPtr zam_cache_roundtrip(const ZBody* orig, ProfileFuncs& pfs) {
         return nullptr;
     }
     auto zb = ZBodySerializer::Deserialize(buf, pfs);
+    if ( zb )
+        ZBodySerializer::VerifyStructure(*orig, *zb);
     if ( zb )
         ++rt_ok;
     else
