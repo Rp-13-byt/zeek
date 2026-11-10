@@ -1,35 +1,46 @@
 # ZAM compilation caching — investigation findings
 
-**Status:** draft for human review. Not for submission as-is.
+**Status:** working opt-in cache, draft for human review. Not for submission
+as-is.
 **Scope:** evaluate caching ZAM script-optimizer output between runs to speed
 up the `-a zam` btest suite (and CI), which currently recompiles everything on
 every process start.
 
-**AI assistance:** this investigation, the instrumentation, and the prototype
-serializer were produced with AI assistance (Claude). A human contributor must
+**AI assistance:** this investigation, the instrumentation, and the cache
+implementation were produced with AI assistance (Claude). A human contributor must
 review the complete diff and this document before any submission, per
 `AI_POLICY.md`.
 
-## Reproducing / exercising the work
+## Using and exercising the work
 
-All additions are gated by environment variables and are completely inert
-unless set (normal `-O ZAM` / `-a zam` behavior is unchanged). Build normally,
-then:
+Everything is opt-in via environment variables; with none set, `-O ZAM` and
+`-a zam` behave exactly as before. All of these require ZAM to be active
+(`-O ZAM` or `ZEEK_ZAM=1`).
 
-- `ZEEK_ZAM_TIMING=1` — per-phase wall-clock breakdown of the optimize/compile
-  pipeline, printed to stderr at the end of `analyze_scripts()`.
-- `ZEEK_ZAM_CACHEABILITY=1` — histogram of which features block serialization;
-  `ZEEK_ZAM_CACHE_ASSUME=type:,aux:call-expr,...` marks features as "assumed
-  handled" to trace the coverage curve.
-- `ZEEK_ZAM_CACHE_KEYS=1` — prints each function's inlining-safe effective key.
-- `ZEEK_ZAM_CACHE_VERIFY=1` — round-trip self-verification: serialize +
-  deserialize each serializable body and install the reconstructed copy, so the
-  btest baselines validate faithfulness. `ZEEK_ZAM_CACHE_DEBUG=1` additionally
-  prints serialization coverage. Validated green on `language/` and `core/`.
+The cache itself:
 
-All of the above require ZAM to be active (`-O ZAM` or `ZEEK_ZAM=1`). The
-on-disk cache itself (`ZEEK_ZAM_CACHE_DIR`) is scaffolded (key + fingerprints)
-but store/load is not yet wired — see "Remaining".
+- `ZEEK_ZAM_CACHE_DIR=<dir>`: enable the on-disk body cache. Each serializable
+  compiled body is stored as `zam-<config>-<key>.zbc`; later runs load matching
+  entries instead of compiling. Concurrent processes may share a directory
+  (writes are temp-file + atomic rename). The cache is bypassed in diagnostic
+  modes (usage analysis, dumps, profiling).
+
+Diagnostics:
+
+- `ZEEK_ZAM_TIMING=1`: per-phase wall-clock breakdown of optimization and
+  compilation, including the cache's own key/load/deserialize work.
+- `ZEEK_ZAM_CACHE_DEBUG=1` (with a cache dir): per-outcome body counts and
+  compile time (hit, stored, or the serializer gate that refused the body), the
+  costliest uncached bodies, and each stored body's key and name.
+- `ZEEK_ZAM_CACHE_KEYS=1`: print each function's effective key.
+- `ZEEK_ZAM_CACHE_VERIFY=1`: round-trip self-verification. Every serializable
+  body is serialized, deserialized, and the reconstruction installed in place of
+  the original, so the btest baselines exercise reconstructed code.
+  `ZEEK_ZAM_CACHE_VERIFY_LOG=<file>` additionally compares every field of each
+  original body against its reconstruction and appends any non-equivalent
+  difference to the file, independent of whether a test exercises it.
+- `ZEEK_ZAM_CACHEABILITY=1` / `ZEEK_ZAM_CACHE_ASSUME=...`: the original sizing
+  analyzer (see "Cacheability analysis").
 
 ## Problem
 
@@ -232,6 +243,25 @@ Validated via the `ZEEK_ZAM_CACHE_KEYS` diagnostic:
   base corpus changed **0** base-function keys — so base bodies hit the cache
   regardless of which test loads them.
 
+**Later finding: source hashes are not enough.** A compiled body also depends
+on the environment it was compiled in, which differs between test processes
+loading different scripts. Sharing a cache directory across tests produced
+*silent* divergence (e.g. `core.tunnels.*` losing `Tunnel::CLOSE` log lines),
+because the profile type-hash covers only a record's *original* fields while
+ZAM hardwires field offsets, redef-extensible enums get load-order-dependent
+values, folded `const` values are keyed by name only, and source locations
+(visible in error messages) aren't hashed at all. The key now also folds in a
+**compile-environment fingerprint** for the body and every transitive callee:
+full type structure (all fields including redef additions, attributes, enum
+name/value maps, unspecified-vector flag), referenced global-constant values
+(hashed structurally, since table iteration order depends on the per-process
+hash seed), and every statement/expression location. Attribute expressions
+involving lambdas are hashed by location and type: rendering them embeds
+randomized lambda names and, once compiled, compiled code, which made ~100
+keys differ between runs until fixed. Coalesced event handlers are keyed on
+their constituent bodies' keys in execution order. Keys are identical across
+cold runs without a fixed hash seed.
+
 ## Serialization architecture (decided, from substrate survey)
 
 Zeek has no general `Type` serializer, but two facts make the ZAM cache
@@ -270,80 +300,95 @@ Reused from CPP where applicable: the name→Type/ID resolvers
 (`get_record_type__CPP`-style via `global_scope()->Find`), and the
 reconstruction *logic* patterns in `RuntimeInits.cc` (not the C++-emission half).
 
-## Implementation status (prototype in progress)
+## Implementation status
 
-All additions are behind env gates and inert otherwise; the build is clean and
-normal ZAM behavior is unchanged when the gates are off.
+Implemented on branch `topic/timw/zam-caching-investigation` (see the commit
+series for detail):
 
-Landed:
-- `ZAMBodyCache` module (`src/script_opt/ZAM/BodyCache.{h,cc}`): opt-in via
-  `ZEEK_ZAM_CACHE_DIR`, with the validated `EffectiveKey`, build-id, and
-  options-hash fingerprints.
-- `ZBodySerializer`: serialize/deserialize of a compiled `ZBody`. Implemented:
-  instruction stream (ops, operands), per-instruction types (by profile
-  type-hash, resolved to live `TypePtr` via `ProfileFuncs::TypeForHash`), atomic
-  constants (bool/int/count/double/time/interval/string/addr/subnet/port/enum),
-  frame denizens/size, managed slots, modules, fixed-frame. A capability gate
-  declines any body with globals, switches, loops, aux, or non-atomic
-  constants, so unsupported bodies fall back to normal compilation.
-- Round-trip self-verification mode (`ZEEK_ZAM_CACHE_VERIFY`): compiles, then
-  serializes + deserializes each serializable body and installs the
-  reconstructed copy, so the existing btest baselines validate faithfulness.
+- `ZAMBodyCache` / `ZBodySerializer` (`src/script_opt/ZAM/BodyCache.{h,cc}`):
+  per-body serialization of compiled ZAM, an on-disk store keyed as above,
+  and load/install that skips compilation on a hit. A hit also restores the
+  side effects compilation would have had (interpreter frame size; one-time
+  ZAM runtime init); bodies whose compilation emitted any diagnostic are never
+  stored, since a hit would silently drop that output.
+- Serialized: instructions and operands; types (by profile type-hash, resolved
+  to the live representative, with a strict failure on mismatch); atomic
+  constants, including constants that optimized built-ins keep in an
+  instruction's constant slot; frame layout; globals (resolved in the global
+  scope, never via the scope stack); loop iterators; switch case maps; and
+  aux data: elems, maps, types, flags, control-flow info, `cat()` args
+  (rebuilt), by-name function/event/ID refs, call expressions (a bounded AST),
+  and record field initializers (re-linked to the type's own).
+- Still not cached, by serializer gate: bodies with lambdas or `when`, call
+  expressions outside the supported shape, non-atomic constants, and a few
+  bodies whose types hit the `vector of any` / `vector()` hash ambiguity
+  (deliberate misses).
 
-Also landed:
-- **Globals** serialized by name (re-resolved via `lookup_ID`).
-- **`ZInstAux` serialization (step 1)**: elems (slots/ints/atomic constants with
-  type hashes), the int-vector maps, type/is_managed vectors, loop vars,
-  value_var_type, the flags, the control-flow map, the `zvec` scratch size, and
-  the `id_val`/`func`/`event_handler` references (by name). Still gated:
-  `lambda`, `wi`, `cat_args`, `attrs`, `field_inits`, `call_expr`, and
-  record/vector-construction maps. This raised round-trip coverage of the base
-  corpus from ~1.6% to ~14.7% of bodies.
-- **On-disk store/load** (`ZAMBodyCache::Store`/`TryLoad`): each serializable
-  body is persisted to `ZEEK_ZAM_CACHE_DIR/zam-<key>.zbc` with a header (magic,
-  format version, build id, options hash, key); writes use temp-file + atomic
-  rename for safe concurrent access. `analyze_scripts_for_ZAM` loads before
-  compiling and installs on a hit (skipping `optimize_func`), storing on a miss.
-  The deserialization ctor runs the one-time ZAM runtime init so a pure
-  cache-hit run (which compiles nothing) is sound. The cache is disabled in
-  diagnostic modes (usage analysis, dumps, profiling).
+## Results
 
-Validated:
-- `language/` and `core/` suites under `-a zam` with round-trip verify: **453/453
-  and 284/284 pass**, identical to control.
-- `language/` and `core/` run **cold (populating) then warm (pure cache-hit)**
-  over a shared cache dir: both passes **453/453** and **284/284** — the
-  load-and-install path that skips `optimize_func` is correct.
+Default script corpus (`zeek -e 'event zeek_init(){}'`, debug+ASan build on
+Apple silicon, median of 3):
 
-Performance note: at the current ~14.7% body coverage the measured speedup is
-negligible — the cacheable bodies are the cheap ones, while the expensive
-call/record-bearing bodies are still gated and recompiled, and the `profile`
-and `inline` phases run regardless. The win materializes as coverage grows
-(see below); the ceiling is roughly the ~87% of per-process ZAM cost that is
-reduce/optimize-AST/use-defs/compile.
+| configuration | wall time |
+|---|---|
+| ZAM off | 0.65 s |
+| ZAM, no cache | 3.60 s |
+| ZAM, warm cache | **1.49 s** |
 
-Remaining (coverage growth + productization):
-- **`call_expr` — the biggest remaining lever** (~19%→~84% of bodies). Used at
-  run time only as the frame's current-call for backtraces (`SetCall`) and as a
-  trigger/`when` memoization key (`trigger->Lookup`), so a reconstructed stand-in
-  carrying the call's location and a stable identity may suffice without full
-  AST serialization — to be confirmed.
-- **Record/vector constructors** (`field_inits`, `attrs`, `cat_args`, the
-  construction maps) — to ~98%. Note the `zvec`/`vv` runtime-scratch hazard:
-  `zvec` is pre-sized by the compiler (its size is already serialized), and
-  field-init default values may be pre-populated at compile time (so their
-  contents, not just the size, would need serializing).
-- Body-level structures still gated: switch case-maps, table/step iterators.
-- A stronger `BuildId` (executable fingerprint, not just version string) and the
-  security hardening noted below before any default-on use. Skipping `profile`
-  and `inline` on a full-cache-hit run is also a future optimization.
+On a warm run 1254 of 1345 compiled bodies (~93%) load from the cache; ZAM's
+own per-process overhead drops from ~2.95 s to ~0.85 s (-71%). What remains is
+mostly the fixed `inline` and `profile` passes, the cache's own
+load/deserialize/key work (~0.2 s), and the 91 bodies still compiled (~0.37 s,
+chiefly call-expression shapes outside the supported set).
 
-## Recommendation
+Validation, at every increment: round-trip verification over `language/` and
+`core/` under `-a zam` (453/453, 284/284) with zero structural differences;
+and two passes of both suites over a *single shared* cache directory, so that
+bodies compiled under one test's scripts are offered to every other test
+(453/453 and 284/284 on both passes).
 
-Proceed to the on-disk `ZBody` cache (serialize fully-optimized bodies, key on
-an inlining-aware hash + build-id + options), implementing the roadmap above in
-priority order and validating against existing btest baselines at each step.
-Steps 1–4 reach ~98% coverage; lambdas/`when` fall back to normal compilation.
-Treat the on-disk cache as an untrusted deserialization boundary per
-`SECURITY_MODEL.md` (build-id/options validation, malformed-input rejection,
-adverse-case tests).
+Not yet measured: the end-to-end wall-clock effect on a full `-a zam` suite
+run or in CI. Per-test savings should approach the per-process figure above
+for tests that load the default scripts; bare-mode (`-b`) tests spend little
+time in ZAM to begin with.
+
+## Lessons from validation
+
+The btest baselines alone were not a sufficient oracle. Several reconstruction
+bugs passed every suite and were found only by the structural comparison
+(`ZEEK_ZAM_CACHE_VERIFY_LOG`) or by sharing one cache across suites:
+
+- Instructions rebuilt via `ZInstI(op, op_type)`, which resolves to the
+  `ZInstI(ZOp, int v1)` constructor and set every `op_type` to `OP_V`.
+- Constants dropped from the constant slot of optimized built-ins whose
+  `op_type` doesn't mark a constant (this silently disabled file analysis in
+  `core.tcp.large-file-reassembly` under verification).
+- By-name globals resolved through the scope stack, binding to same-named
+  locals.
+- `vector of any` and the unspecified `vector()` sharing a profile hash.
+- Lost parenthesization in reconstructed call expressions.
+- The cross-process key gaps described under "Effective cache key".
+
+Any further serializer work should keep both checks in its loop.
+
+## Remaining work
+
+- **Productization.** `BuildId` is the version string plus a format version,
+  which does not change between local rebuilds of the same version; before
+  default-on use it needs a real binary fingerprint (executable hash or
+  mtime+size). No cache eviction or size management exists. Decide how the
+  btest `zam` alternative and CI would enable the cache (e.g. a per-run
+  `ZEEK_ZAM_CACHE_DIR` in `btest.cfg`).
+- **Security** (per `SECURITY_MODEL.md`). The cache directory is a
+  deserialization boundary. Loads validate headers, bound sizes, and fail
+  closed on malformed or unresolvable data, but there is no integrity
+  protection against a writer who can modify cache files. Adverse-case tests
+  (truncated, corrupted, and mismatched-header files) still need to be added as
+  btests.
+- **Regression tests.** Add focused btests for the cache itself (cold/warm
+  equivalence, configuration separation, diagnostics-mode bypass) in addition
+  to the suite-wide verification used during development.
+- **Coverage.** The remaining ~6% of bodies (lambdas, `when`, other
+  call-expression shapes) and the fixed per-process passes (`inline`,
+  `profile`) are now the main costs; skipping those passes on an all-hit run
+  would need care, since inlining decisions also determine which bodies exist.
