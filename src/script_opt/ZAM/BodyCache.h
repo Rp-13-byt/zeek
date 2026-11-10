@@ -58,6 +58,7 @@ public:
     // cache separately scopes entries by BuildId()/OptionsHash().
     static p_hash_type EffectiveKey(const ProfileFunc* pf, const ProfileFuncs& pfs);
 
+
     // Fingerprints that must match for a cache entry to be reused. BuildId
     // captures anything that can change ZAM output across binaries; OptionsHash
     // captures the ZAM-affecting analysis options.
@@ -83,6 +84,8 @@ public:
     void Store(p_hash_type key, const std::string& body, int frame_size) const;
 
 private:
+    static p_hash_type EffectiveKeyUncached(const ProfileFunc* pf, const ProfileFuncs& pfs);
+
     void ComputeBuildId();
     void ComputeOptionsHash();
     std::string PathFor(p_hash_type key) const;

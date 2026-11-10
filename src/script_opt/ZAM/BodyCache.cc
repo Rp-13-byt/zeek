@@ -68,31 +68,76 @@ ZAMBodyCache::ZAMBodyCache() {
 namespace {
 
 p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_type>& memo,
-                          std::unordered_set<const Type*>& active);
+                          std::unordered_set<const Type*>& active, bool& saw_cycle);
+
+// A stable hash of an attribute expression. Plain Describe() is not stable for
+// lambdas (e.g. "&default=function(n: count): string {...}"): their names are
+// randomized per process, and their bodies render differently once compiled to
+// ZAM, which happens partway through the very compile loop computing keys. So
+// any expression whose rendering involves a lambda or compiled code is instead
+// identified by its source location, type, and tag. (A caller's compiled body
+// doesn't embed such expressions; they're evaluated at run time from the
+// loading process's own attributes.)
+p_hash_type env_attr_expr_hash(const Expr* e) {
+    ODesc d;
+    e->Describe(&d);
+    std::string_view desc(d.Description());
+    if ( desc.find("lambda_<") == std::string_view::npos && desc.find("ZAM-code") == std::string_view::npos )
+        return p_hash(desc);
+
+    auto l = e->GetLocationInfo();
+    p_hash_type h = p_hash(static_cast<int>(e->Tag()));
+    h = merge_p_hashes(h, p_hash(std::string_view(l && l->FileName() ? l->FileName() : "")));
+    h = merge_p_hashes(h, p_hash(l ? l->FirstLine() : 0));
+    h = merge_p_hashes(h, p_hash(l ? l->LastLine() : 0));
+    if ( const auto& t = e->GetType() ) {
+        ODesc td;
+        t->Describe(&td);
+        h = merge_p_hashes(h, p_hash(std::string_view(td.Description())));
+    }
+    return h;
+}
 
 p_hash_type env_attrs_hash(const Attributes* attrs) {
     if ( ! attrs )
         return 0;
-    ODesc d;
-    attrs->Describe(&d);
-    return p_hash(std::string_view(d.Description()));
+    p_hash_type h = p_hash("attrs");
+    for ( const auto& a : attrs->GetAttrs() ) {
+        h = merge_p_hashes(h, p_hash(static_cast<int>(a->Tag())));
+        if ( const auto& e = a->GetExpr() )
+            h = merge_p_hashes(h, env_attr_expr_hash(e.get()));
+    }
+    return h;
 }
 
 p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_type>& memo,
-                          std::unordered_set<const Type*>& active) {
+                          std::unordered_set<const Type*>& active, bool& saw_cycle) {
+    // Hashes of types whose traversal never reached an in-progress type depend
+    // only on the type itself, so they are shared across all roots. Hashes
+    // computed under a cycle depend on where the cycle was entered, so they are
+    // only memoized within the current root's walk ('memo').
+    static std::unordered_map<const Type*, p_hash_type> acyclic_memo;
+
     if ( ! t )
         return 0;
-    if ( auto it = memo.find(t); it != memo.end() )
+    if ( auto it = acyclic_memo.find(t); it != acyclic_memo.end() )
         return it->second;
+    if ( auto it = memo.find(t); it != memo.end() ) {
+        saw_cycle = true; // conservatively: this entry may be cycle-dependent
+        return it->second;
+    }
 
     p_hash_type h = merge_p_hashes(p_hash(static_cast<int>(t->Tag())), p_hash(std::string_view(t->GetName())));
 
     // Recursive types: within an in-progress traversal, refer to the type by
     // tag + name only (its full structure is accounted for by the outer visit).
-    if ( ! active.insert(t).second )
+    if ( ! active.insert(t).second ) {
+        saw_cycle = true;
         return h;
+    }
 
-    auto sub = [&](const Type* st) { h = merge_p_hashes(h, env_type_hash(st, memo, active)); };
+    bool local_cycle = false;
+    auto sub = [&](const Type* st) { h = merge_p_hashes(h, env_type_hash(st, memo, active, local_cycle)); };
 
     switch ( t->Tag() ) {
         case TYPE_RECORD: {
@@ -136,7 +181,31 @@ p_hash_type env_type_hash(const Type* t, std::unordered_map<const Type*, p_hash_
     }
 
     active.erase(t);
-    memo[t] = h;
+    if ( local_cycle ) {
+        memo[t] = h;
+        saw_cycle = true;
+    }
+    else
+        acyclic_memo[t] = h;
+    return h;
+}
+
+// Hash of a type's full structure, as a function of the type alone. Recursive
+// types make a nested hash depend on which types are already being visited, so
+// a memo freely shared across different roots would make results depend on
+// traversal order (which, via unordered sets of pointers, can vary between
+// processes). So each root is hashed by a deterministic depth-first walk; only
+// root results and acyclic subtrees (see env_type_hash) are cached across walks.
+p_hash_type env_type_hash_root(const Type* t) {
+    static std::unordered_map<const Type*, p_hash_type> root_memo;
+    if ( auto it = root_memo.find(t); it != root_memo.end() )
+        return it->second;
+
+    std::unordered_map<const Type*, p_hash_type> memo;
+    std::unordered_set<const Type*> active;
+    bool saw_cycle = false;
+    auto h = env_type_hash(t, memo, active, saw_cycle);
+    root_memo[t] = h;
     return h;
 }
 
@@ -196,22 +265,20 @@ p_hash_type env_value_hash(const Val* v, int depth = 0) {
 }
 
 // Fingerprint of the environment a single profiled body compiles against.
-p_hash_type env_fingerprint(const ProfileFunc* pf) {
+p_hash_type env_fingerprint_uncached(const ProfileFunc* pf) {
     // Memoized across calls within a run; types and global values are fixed
     // by the time ZAM compilation happens.
-    static std::unordered_map<const Type*, p_hash_type> type_memo;
     static std::unordered_map<const ID*, p_hash_type> global_memo;
-    std::unordered_set<const Type*> active;
 
     std::set<p_hash_type> parts;
     for ( auto t : pf->OrderedTypes() )
-        parts.insert(env_type_hash(t, type_memo, active));
+        parts.insert(env_type_hash_root(t));
 
     for ( auto& g : pf->AllGlobals() ) {
         auto [it, inserted] = global_memo.emplace(g.get(), 0);
         if ( inserted ) {
             p_hash_type gh = merge_p_hashes(p_hash(std::string_view(g->Name())), p_hash(g->IsConst() ? 1 : 0));
-            gh = merge_p_hashes(gh, env_type_hash(g->GetType().get(), type_memo, active));
+            gh = merge_p_hashes(gh, env_type_hash_root(g->GetType().get()));
             gh = merge_p_hashes(gh, env_attrs_hash(g->GetAttrs().get()));
             if ( g->IsConst() && g->GetVal() )
                 gh = merge_p_hashes(gh, env_value_hash(g->GetVal().get()));
@@ -243,9 +310,31 @@ p_hash_type env_fingerprint(const ProfileFunc* pf) {
     return h;
 }
 
+
+// The fingerprint is a pure function of the profile within a run, and the
+// same callees recur in many functions' keys, so memoize it.
+p_hash_type env_fingerprint(const ProfileFunc* pf) {
+    static std::unordered_map<const ProfileFunc*, p_hash_type> memo;
+    if ( auto it = memo.find(pf); it != memo.end() )
+        return it->second;
+    auto h = env_fingerprint_uncached(pf);
+    memo[pf] = h;
+    return h;
+}
 } // namespace
 
 p_hash_type ZAMBodyCache::EffectiveKey(const ProfileFunc* pf, const ProfileFuncs& pfs) {
+    // Keys are needed for a function and, via coalesced handlers, for its
+    // constituents; memoize per profile (fixed for the run).
+    static std::unordered_map<const ProfileFunc*, p_hash_type> memo;
+    if ( auto it = memo.find(pf); it != memo.end() )
+        return it->second;
+    auto k = EffectiveKeyUncached(pf, pfs);
+    memo[pf] = k;
+    return k;
+}
+
+p_hash_type ZAMBodyCache::EffectiveKeyUncached(const ProfileFunc* pf, const ProfileFuncs& pfs) {
     // Returns 0 ("no usable key") if any reachable body lacks a computed hash,
     // so the caller treats the function as non-cacheable rather than keying on
     // an incomplete fingerprint.
