@@ -848,12 +848,23 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
         p_hash_type cache_key = 0;
         bool cache_enabled = body_cache.Enabled() && cache_modes_ok && f.Profile();
         if ( cache_enabled ) {
+            ZAMPhaseTimer t("cache-key");
             cache_key = ZAMBodyCache::EffectiveKey(f.Profile(), *pfs);
             cache_enabled = cache_key != 0; // 0 => no usable key, don't cache
         }
         if ( cache_enabled ) {
-            if ( auto entry = body_cache.TryLoad(cache_key) )
-                if ( auto zb = ZBodySerializer::Deserialize(entry->body, *pfs) ) {
+            std::optional<ZAMBodyCache::Entry> entry;
+            ZBodyPtr zb;
+            {
+                ZAMPhaseTimer t("cache-load");
+                entry = body_cache.TryLoad(cache_key);
+            }
+            if ( entry ) {
+                ZAMPhaseTimer t("cache-deserialize");
+                zb = ZBodySerializer::Deserialize(entry->body, *pfs);
+            }
+            if ( entry )
+                if ( zb ) {
                     // Compilation may enlarge the interpreter frame (for reducer
                     // temporaries); a hit skips it, so restore the requirement.
                     if ( entry->frame_size > func->FrameSize() )
@@ -896,6 +907,9 @@ static void analyze_scripts_for_ZAM(const std::shared_ptr<ProfileFuncs>& pfs) {
                 if ( ZBodySerializer::Serialize(*static_cast<ZBody*>(new_body.get()), *pfs, bytes, &why) ) {
                     body_cache.Store(cache_key, bytes, func->FrameSize());
                     outcome = "stored";
+                    if ( cache_debug )
+                        fprintf(stderr, "ZAM-cache-stored %016llx %s\n", static_cast<unsigned long long>(cache_key),
+                                func->GetName().c_str());
                 }
                 else
                     outcome = why;
