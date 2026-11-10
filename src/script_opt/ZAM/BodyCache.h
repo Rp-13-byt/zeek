@@ -35,7 +35,7 @@ using ZBodyPtr = IntrusivePtr<ZBody>;
 
 // Bump whenever the on-disk format or any ZAM encoding detail changes, so old
 // cache files are rejected rather than misread.
-constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 2;
+constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 3;
 
 class ZAMBodyCache {
 public:
