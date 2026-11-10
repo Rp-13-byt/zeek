@@ -1606,8 +1606,13 @@ constexpr uint32_t ZAM_CACHE_MAGIC = 0x5A42'4331; // "ZBC1"
 } // namespace
 
 std::string ZAMBodyCache::PathFor(p_hash_type key) const {
-    char name[32];
-    snprintf(name, sizeof name, "zam-%016llx.zbc", static_cast<unsigned long long>(key));
+    // Include the configuration (build identity + analysis options) in the
+    // name, not just the header, so that differently configured runs sharing a
+    // cache directory keep separate entries rather than overwriting each other.
+    auto config = merge_p_hashes(p_hash(std::string_view(build_id)), options_hash);
+    char name[64];
+    snprintf(name, sizeof name, "zam-%016llx-%016llx.zbc", static_cast<unsigned long long>(config),
+             static_cast<unsigned long long>(key));
     return dir + "/" + name;
 }
 
