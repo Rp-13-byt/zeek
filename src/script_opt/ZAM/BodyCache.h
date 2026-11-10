@@ -22,8 +22,11 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "zeek/IntrusivePtr.h"
 #include "zeek/script_opt/ProfileFunc.h"
@@ -35,7 +38,7 @@ using ZBodyPtr = IntrusivePtr<ZBody>;
 
 // Bump whenever the on-disk format or any ZAM encoding detail changes, so old
 // cache files are rejected rather than misread.
-constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 6;
+constexpr uint32_t ZAM_CACHE_FORMAT_VERSION = 7;
 
 class ZAMBodyCache {
 public:
@@ -94,6 +97,11 @@ private:
 // by the on-disk cache and by the round-trip self-verification mode.
 class ZBodySerializer {
 public:
+    // The record type's creation-time field initializers (private to
+    // RecordType, which befriends this class). Used to re-link a record
+    // constructor's field initializers when loading a cached body.
+    static const std::vector<std::pair<int, std::shared_ptr<FieldInit>>>& CreationInits(const RecordType* rt);
+
     // Serialize 'body' into 'out'. Returns false (leaving 'out' unspecified) if
     // the body uses a feature not yet supported by the serializer, in which
     // case the caller must not cache it.
